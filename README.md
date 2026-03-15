@@ -1,65 +1,86 @@
-# eBookReaderSwitch
+# WookReader
 
-### Features:
-* Saves last page number
-* Reads PDF, EPUB, CBZ, and XPS files
-* Dark and light mode
-* Landscape reading view
-* Portrait reading view
-* Touch screen controls
-	* Touch the botton/top of the screen to zoom in/out and left and right to change the page.
-* Books read from `/switch/eBookReader/books`
+A comic and e-book reader for the Nintendo Switch.
 
-### TODO:
-* Do some extra testing on file compatibility.
-* 2 pages side by side in landscape.
-* Hardware lock to prevent accidental touches (maybe Vol- ?) (?).
-* Save orientation, and dark mode settings.
+Fork of eBookReaderSwitch with major improvements to performance, format support, and usability.
 
-### Screen Shots:
+## Features
 
-Dark Mode Help Menu:
-<br></br>
-<img src="screenshots/darkModeHelp.jpg" width="322" height="178.4">
-<br></br>
+- **Format support:** PDF, EPUB, XPS, CBZ, CBR, CBT, CB7
+- **Reading modes:** Portrait, Landscape, Vertical (fit-to-width), Spread (two-page)
+- **Cover grid browser** with folder navigation and thumbnail previews
+- **Async prefetch** — next/previous pages pre-rendered for instant page turns
+- **Raw image LRU cache** — revisited pages load instantly
+- **Early first-page display** — cover shown in ~0.5s while large archives enumerate in background
+- **Page-name disk cache** — second+ open of any comic skips enumeration entirely
+- **RAR3 fast enumeration** — header-only scan (~50ms for 500MB solid RAR)
+- **Progressive navigation** — flip through pages while archive is still scanning
+- **Analog stick scrolling** — full 360° proportional panning with left stick
+- **Pinch-to-zoom** and right-stick zoom
+- **Dark and light mode**
+- **Saves last page, orientation, and dark mode settings**
+- **Sorted file browser** (folders first A-Z, files A-Z, case-insensitive)
 
-Dark Mode Landscape Reading (With the Switch horizonal):
-<br></br>
-<img src="screenshots/darkModeLandscape.jpg" width="512" height="288">
-<br></br>
+## Installation
 
-Dark Mode Portrait Reading (With the Switch vertical):
-<br></br>
-<img src="screenshots/darkModePortrait.jpg" width="285.6" height="408.8">
-<br></br>
+1. Copy `WookReader.nro` to `/switch/` on the SD card
+2. Create the folder `/switch/WookReader/`
+3. Put your comics and books in folders inside `/switch/WookReader/`
 
-Dark Mode Book Selection:
-<br></br>
-<img src="screenshots/darkModeSelection.jpg" width="512" height="288">
-<br></br>
+## Controls
 
-Light Mode Landscape Reading:
-<br></br>
-<img src="screenshots/lightModeLandscape.jpg" width="512" height="288">
+| Input | Portrait / Vertical | Landscape |
+|---|---|---|
+| D-Pad Left/Right | Prev / Next page | Prev / Next page |
+| D-Pad Up/Down | Zoom max / Zoom out | Prev / Next page |
+| ZL / ZR | Prev / Next page | Zoom out / Zoom in |
+| R+ZR / L+ZL | Skip 9 pages forward/back | Skip 9 pages forward/back |
+| Left Stick | Analog scroll (360°) | Analog scroll (360°) |
+| Right Stick | Zoom in/out | Prev / Next page |
+| Y | Cycle layout modes | Cycle layout modes |
+| Touch | Drag=scroll, Pinch=zoom, Tap sides=page turn | Drag=scroll, Pinch=zoom |
 
-### Credit:
-* moronigranja - For allowing more file support
-* NX-Shell Team - A good amount of the code is from an old version of their application.
+## Screenshots
 
-### Building
-* Release built with [libnx release v4.1.3](https://github.com/switchbrew/libnx).
-* Uses `freetype` and other libs which comes with `switch-portlibs` via `devkitPro pacman`:
+Dark Mode Folders:
+
+<img src="screenshots/NewDarkModeFolder.jpg" width="512" height="288">
+
+Dark Mode Reading:
+
+<img src="screenshots/NewDarkModeBook.jpg" width="512" height="288">
+
+Dark Mode Options:
+
+<img src="screenshots/NewDarkModeOptions.jpg" width="512" height="288">
+
+Light Mode Folders:
+
+<img src="screenshots/NewLightModeFolders.jpg" width="512" height="288">
+
+Light Mode Reading:
+
+<img src="screenshots/NewLightModeBook.jpg" width="512" height="288">
+
+## Building
+
+Requires [devkitPro](https://devkitpro.org/) with devkitA64 and Switch portlibs:
+
 ```
 pacman -S libnx switch-portlibs
 ```
-then run:
+
+Build:
+
 ```
 make mupdf
 make
 ```
-to build.
 
-If you don't have twili debugger installed, delete the `-ltwili` flag on the Makefile to compile:
-```
-LIBS: -ltwili
-```
+If you don't have twili debugger installed, remove the `-ltwili` flag from the Makefile.
+
+## Credits
+
+- moronigranja — expanded file format support
+- NX-Shell Team — original application code base
+- Papirus Icon Theme — folder/file icon design inspiration
