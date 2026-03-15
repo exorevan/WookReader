@@ -1,5 +1,5 @@
-#ifndef EBOOK_READER_SDL_HELPER_H
-#define EBOOK_READER_SDL_HELPER_H
+#ifndef WOOK_READER_SDL_HELPER_H
+#define WOOK_READER_SDL_HELPER_H
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
@@ -45,5 +45,11 @@ void SDL_DrawHorizonalAlignedImageText (SDL_Renderer *renderer, SDL_Texture *tex
 void SDL_InvertSurfaceColor(SDL_Surface *surface);
 Uint32 SDL_GetPixel32(SDL_Surface *surface, int x, int y);
 void SDL_PutPixel32(SDL_Surface *surface, int x, int y, Uint32 pixel);
+
+// Text texture cache — eliminates per-frame alloc/free in SDL_DrawText/SDL_DrawRotatedText.
+// Call SDL_TextCache_NextFrame() once per main-loop iteration.
+// Call SDL_TextCache_Clear() before TTF_Quit() in Term_Services().
+void SDL_TextCache_NextFrame(void);
+void SDL_TextCache_Clear(void);
 
 #endif

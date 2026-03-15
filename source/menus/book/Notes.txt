@@ -1,0 +1,4 @@
+Author of original code mislabled landscape and potrait
+Take links of websites that have ebook/manga
+Small Inconsiquential bug in the menu select that allows you to leave the selection
+Small bug in max_zoom that makes a light blur on the page after zoom

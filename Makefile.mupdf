@@ -1,64 +1,260 @@
-#---------------------------------------------------------------------------------
-.SUFFIXES:
-#---------------------------------------------------------------------------------
+# Makefile.mupdf — сборка libmupdf.a (MuPDF 1.16.1) для Nintendo Switch
+#
+# Использование (из корня проекта):
+#   make -f Makefile.switch -j4
+#   make -f Makefile.switch clean
+#
+# Требования:
+#   - Установленный devkitPro (https://devkitpro.org/wiki/Getting_Started)
+#   - Переменная окружения DEVKITPRO должна указывать на корень devkitPro
+#   - Исходники MuPDF 1.16.1 в директории mupdf/
+#   - Файлы slimftmodules.h и slimftoptions.h в mupdf/scripts/freetype/
+#   - Сгенерированные файлы шрифтов в mupdf/generated/
+#     (генерируются командой: make -C mupdf generate)
 
+# ── Проверка переменной окружения ──────────────────────────────────────────
 ifeq ($(strip $(DEVKITPRO)),)
-$(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/devkitpro")
+$(error "Переменная окружения DEVKITPRO не задана. \
+Установите её: export DEVKITPRO=/opt/devkitpro")
 endif
 
-TOPDIR ?= $(CURDIR)
-include $(DEVKITPRO)/libnx/switch_rules
+# ── Тулчейн ────────────────────────────────────────────────────────────────
+# Нормализуем путь: Windows C:\... → Unix /c/... (через cygpath если доступен)
+DEVKITPRO_UNIX := $(subst \,/,$(DEVKITPRO))
+DEVKITPRO_UNIX := $(shell \
+	if command -v cygpath > /dev/null 2>&1; then \
+		cygpath -u "$(DEVKITPRO)"; \
+	else \
+		echo "$(DEVKITPRO_UNIX)"; \
+	fi)
 
-TOOL_PREFIX ?= aarch64-none-elf-
+TOOLCHAIN := $(DEVKITPRO_UNIX)/devkitA64/bin
+CC        := $(TOOLCHAIN)/aarch64-none-elf-gcc
+AR        := $(TOOLCHAIN)/aarch64-none-elf-ar
+BIN2COFF  := $(TOOLCHAIN)/aarch64-none-elf-objcopy
 
-#---------------------------------------------------------------------------------
-# options for code generation
-#---------------------------------------------------------------------------------
-ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+# ── Архитектура Switch (Cortex-A57, AArch64) ───────────────────────────────
+ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIC
 
-CFLAGS	:=	-g -O2 -ffunction-sections \
-			$(ARCH) $(DEFINES)
+# ── Определения препроцессора ───────────────────────────────────────────────
+#
+# ВАЖНО про ICC:
+#   В MuPDF 1.16 все ICC-объявления (fz_icc_profile, fz_new_icc_context и др.)
+#   обёрнуты в #if FZ_ENABLE_ICC (см. color.h). Флаг -DNO_ICC использовался
+#   только внутри color-lcms.c и не влиял на заголовки — поэтому типы и
+#   функции оставались объявленными, но не реализованными → "undefined reference".
+#
+#   ПРАВИЛЬНОЕ РЕШЕНИЕ: -DFZ_ENABLE_ICC=0
+#   Это отключает ICC-объявления прямо в заголовках. color-lcms.c исключается
+#   из сборки (см. ниже). Stub-файл больше не нужен.
+#
+DEFINES := \
+	-DNDEBUG \
+	-DTOFU -DTOFU_CJK \
+	-DFZ_ENABLE_ICC=0 \
+	-DHAVE_PTHREAD=0 \
+	-DOPJ_STATIC \
+	-DOPJ_HAVE_STDINT_H \
+	-DOPJ_HAVE_INTTYPES_H \
+	-DFT2_BUILD_LIBRARY \
+	'-DFT_CONFIG_MODULES_H="slimftmodules.h"' \
+	'-DFT_CONFIG_OPTIONS_H="slimftoptions.h"' \
+	-Dtimegm=mktime
 
-CFLAGS	+=	-D__SWITCH__ $(INCLUDE) `sdl2-config --cflags`
+# ── Пути включения ──────────────────────────────────────────────────────────
+INCLUDES := \
+	-Imupdf/include \
+	-Imupdf/generated \
+	-Imupdf/scripts/freetype \
+	-Imupdf/scripts/libjpeg \
+	-Imupdf/thirdparty/freetype/include \
+	-Imupdf/thirdparty/harfbuzz/src \
+	-Imupdf/thirdparty/jbig2dec \
+	-Imupdf/thirdparty/libjpeg \
+	-Imupdf/thirdparty/mujs \
+	-Imupdf/thirdparty/openjpeg/src/lib/openjp2 \
+	-Imupdf/thirdparty/zlib
 
-CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -DDEBUG=1 -DTOFU_NOTO= -DTOFU_CJK=
+# ── Флаги компиляции ────────────────────────────────────────────────────────
+CFLAGS := $(ARCH) -O2 -Wno-error -std=gnu11 $(DEFINES) $(INCLUDES)
 
-ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+# ── MuPDF core ──────────────────────────────────────────────────────────────
+FITZ_SRC := $(wildcard mupdf/source/fitz/*.c)
+PDF_SRC  := $(wildcard mupdf/source/pdf/*.c)
+XPS_SRC  := $(wildcard mupdf/source/xps/*.c)
+SVG_SRC  := $(wildcard mupdf/source/svg/*.c)
+CBZ_SRC  := $(wildcard mupdf/source/cbz/*.c)
+HTML_SRC := $(wildcard mupdf/source/html/*.c)
 
-#---------------------------------------------------------------------------------
-# list of directories containing libraries, this must be the top level containing
-# include and lib
-#---------------------------------------------------------------------------------
-LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+MUPDF_SRC := $(FITZ_SRC) $(PDF_SRC) $(XPS_SRC) $(SVG_SRC) $(CBZ_SRC) $(HTML_SRC)
 
-export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
-			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
-			-I$(CURDIR)/$(BUILD)
+# Исключаем color-lcms.c (LCMS) и color-icc-stub.c (устаревший stub).
+# При -DFZ_ENABLE_ICC=0 все ICC-объявления скрыты в заголовках,
+# поэтому никакие заглушки не нужны.
+# color-icc-stub.c удаляется явно на случай если он остался на диске.
+$(shell rm -f mupdf/source/fitz/color-icc-stub.c)
+MUPDF_SRC := $(filter-out \
+	mupdf/source/fitz/color-lcms.c \
+	mupdf/source/fitz/color-icc-stub.c \
+	, $(MUPDF_SRC))
 
-#---------------------------------------------------------------------------------
-.PHONY: mupdf
+# ── FreeType ─────────────────────────────────────────────────────────────────
+FREETYPE_SRC := \
+	mupdf/thirdparty/freetype/src/base/ftbase.c \
+	mupdf/thirdparty/freetype/src/base/ftbbox.c \
+	mupdf/thirdparty/freetype/src/base/ftbitmap.c \
+	mupdf/thirdparty/freetype/src/base/ftdebug.c \
+	mupdf/thirdparty/freetype/src/base/ftgasp.c \
+	mupdf/thirdparty/freetype/src/base/ftglyph.c \
+	mupdf/thirdparty/freetype/src/base/ftinit.c \
+	mupdf/thirdparty/freetype/src/base/ftstroke.c \
+	mupdf/thirdparty/freetype/src/base/ftsynth.c \
+	mupdf/thirdparty/freetype/src/base/ftsystem.c \
+	mupdf/thirdparty/freetype/src/base/fttype1.c \
+	mupdf/thirdparty/freetype/src/cff/cff.c \
+	mupdf/thirdparty/freetype/src/cid/type1cid.c \
+	mupdf/thirdparty/freetype/src/psaux/psaux.c \
+	mupdf/thirdparty/freetype/src/pshinter/pshinter.c \
+	mupdf/thirdparty/freetype/src/psnames/psnames.c \
+	mupdf/thirdparty/freetype/src/raster/raster.c \
+	mupdf/thirdparty/freetype/src/sfnt/sfnt.c \
+	mupdf/thirdparty/freetype/src/smooth/smooth.c \
+	mupdf/thirdparty/freetype/src/truetype/truetype.c \
+	mupdf/thirdparty/freetype/src/type1/type1.c
 
-#---------------------------------------------------------------------------------
-mupdf:
-	@echo Building mupdf ...
-	@$(shell ./opt/devkitpro/switchvars.sh $<)
-	$(MAKE) -e -C mupdf \
-  CC=${TOOL_PREFIX}gcc \
-  CXX=${TOOL_PREFIX}g++ \
-  LD=${TOOL_PREFIX}ld \
-  AR=${TOOL_PREFIX}ar \
-  RANLIB=${TOOL_PREFIX}ranlib \
-  XCFLAGS="${CPPFLAGS} ${CFLAGS}" \
-  USE_SYSTEM_FREETYPE=yes \
-  USE_SYSTEM_HARFBUZZ=no \
-  USE_SYSTEM_JBIG2DEC=no \
-  USE_SYSTEM_JPEGXR=no \
-  USE_SYSTEM_LCMS2=no \
-  USE_SYSTEM_LIBJPEG=yes \
-  USE_SYSTEM_MUJS=no \
-  USE_SYSTEM_OPENJPEG=no \
-  USE_SYSTEM_ZLIB=no \
-  libs
-	@mkdir -p mupdf/lib
-	@cp -f mupdf/build/release/*.a mupdf/lib
+# ── zlib ─────────────────────────────────────────────────────────────────────
+ZLIB_SRC := $(wildcard mupdf/thirdparty/zlib/*.c)
+ZLIB_SRC := $(filter-out \
+	%/example.c %/minigzip.c \
+	%/gzclose.c %/gzlib.c %/gzread.c %/gzwrite.c \
+	, $(ZLIB_SRC))
+
+# ── libjpeg ──────────────────────────────────────────────────────────────────
+JPEG_SRC := $(wildcard mupdf/thirdparty/libjpeg/*.c)
+JPEG_SRC := $(filter-out \
+	%/wrjpgcom.c %/rdjpgcom.c %/djpeg.c %/cjpeg.c \
+	%/jpegtran.c %/example.c %/jmemmac.c %/jmemdos.c \
+	%/jmemname.c \
+	%/cdjpeg.c %/ckconfig.c \
+	%/rdcolmap.c %/rdswitch.c %/transupp.c \
+	%/wrgif.c %/rdgif.c \
+	%/wrbmp.c %/rdbmp.c \
+	%/wrtarga.c %/rdtarga.c \
+	%/wrppm.c %/rdppm.c \
+	%/wrrle.c %/rdrle.c \
+	%/jmemcust.c %/jmemnobs.c \
+	, $(JPEG_SRC))
+
+# ── jbig2dec ─────────────────────────────────────────────────────────────────
+JBIG2_SRC := $(wildcard mupdf/thirdparty/jbig2dec/*.c)
+JBIG2_SRC := $(filter-out \
+	%/jbig2dec.c \
+	%/getopt.c \
+	%/getopt1.c \
+	%/jbig2_image_png.c \
+	%/pbm2png.c \
+	%/snprintf.c \
+	, $(JBIG2_SRC))
+
+# ── OpenJPEG ─────────────────────────────────────────────────────────────────
+OPJ_SRC := $(wildcard mupdf/thirdparty/openjpeg/src/lib/openjp2/*.c)
+OPJ_SRC := $(filter-out \
+	%/bench_dwt.c \
+	%/test_sparse_array.c \
+	%/cidx_manager.c \
+	%/phix_manager.c \
+	%/ppix_manager.c \
+	%/thix_manager.c \
+	%/tpix_manager.c \
+	, $(OPJ_SRC))
+
+# ── MuJS ─────────────────────────────────────────────────────────────────────
+# ВАЖНО: one.c — это амальгамация, которая #include-ит все остальные js*.c.
+# Если включить и one.c, и отдельные файлы — получим дублирование символов
+# внутри самой libmupdf.a. Исключаем one.c, используем отдельные файлы.
+MUJS_SRC := $(wildcard mupdf/thirdparty/mujs/*.c)
+MUJS_SRC := $(filter-out \
+	%/main.c \
+	%/jsrepr.c \
+	%/one.c \
+	, $(MUJS_SRC))
+
+# ── Сгенерированные файлы шрифтов ────────────────────────────────────────────
+# MuPDF встраивает шрифты (Nimbus, Dingbats и др.) как C-массивы через objcopy.
+# Файлы в mupdf/generated/ генерируются командой:
+#   cd mupdf && make generate
+#
+# ВАЖНО: $(MAKE) нельзя вызывать из ifeq-блока на этапе разбора Makefile —
+# это ломает парсинг на Windows (пробелы в пути). Генерация вынесена в цель
+# `generate-fonts`, которая вызывается явно из цели `all` при необходимости.
+GENERATED_DIR := mupdf/generated
+GEN_SRC := $(shell find $(GENERATED_DIR) -name "*.c" 2>/dev/null)
+
+# ── Все исходники и объектные файлы ──────────────────────────────────────────
+ALL_SRC := $(MUPDF_SRC) $(FREETYPE_SRC) $(ZLIB_SRC) $(JPEG_SRC) \
+           $(JBIG2_SRC) $(OPJ_SRC) $(MUJS_SRC) $(GEN_SRC)
+ALL_OBJ := $(ALL_SRC:.c=.o)
+
+OUTPUT := lib/libmupdf.a
+
+# ── Цели сборки ──────────────────────────────────────────────────────────────
+
+# Если mupdf/generated/ пуста — сначала генерируем шрифты, затем пересобираем.
+ifeq ($(strip $(GEN_SRC)),)
+all: generate-fonts
+	@$(MAKE) -f $(firstword $(MAKEFILE_LIST))
+else
+all: lib_dir $(ALL_OBJ)
+	$(AR) rcs $(OUTPUT) $(ALL_OBJ)
+	@echo ">>> $(OUTPUT) собран успешно <<<"
+endif
+
+# Генерация встроенных шрифтов MuPDF через shell + od.
+# Не требует Python, нативного cc или objcopy — только sh и od,
+# которые всегда есть в msys2/devkitPro.
+#
+# Для каждого .cff/.otf/.ttf в mupdf/resources/fonts/{urw,noto,han}/:
+#   od -An -tx1 читает файл и выводит байты в hex → awk форматирует в C-массив.
+#
+# Альтернатива: скопировать готовые .c файлы в mupdf/generated/ с Linux/macOS.
+generate-fonts:
+	@echo ">>> Генерируем встроенные шрифты MuPDF (shell + od)..."
+	@mkdir -p mupdf/generated
+	@count=0; \
+	for dir in mupdf/resources/fonts/urw mupdf/resources/fonts/noto mupdf/resources/fonts/han; do \
+		[ -d "$$dir" ] || continue; \
+		for fpath in "$$dir"/*.cff "$$dir"/*.otf "$$dir"/*.ttf; do \
+			[ -f "$$fpath" ] || continue; \
+			fname=$$(basename "$$fpath"); \
+			sym=$$(echo "_binary_$$fname" | tr '.-' '__'); \
+			out="mupdf/generated/$${sym}.c"; \
+			{ \
+				printf '/* Auto-generated by Makefile.mupdf generate-fonts */\n'; \
+				printf '#include <stddef.h>\n'; \
+				printf 'static const unsigned char font_data[] = {\n'; \
+				od -An -tx1 -v "$$fpath" | awk '{for(i=1;i<=NF;i++) printf "0x%s,", $$i; print ""}'; \
+				printf '\n};\n'; \
+				printf 'const unsigned char *const %s = font_data;\n' "$$sym"; \
+				printf 'const unsigned int %s_size = %s;\n' "$$sym" "$$(wc -c < "$$fpath" | tr -d ' \r')"; \
+			} > "$$out"; \
+			count=$$((count + 1)); \
+		done; \
+	done; \
+	if [ "$$count" -eq 0 ]; then \
+		echo "ОШИБКА: шрифты не найдены в mupdf/resources/fonts/{urw,noto,han}/"; \
+		echo "Убедитесь что субмодуль mupdf инициализирован: git submodule update --init"; \
+		false; \
+	fi; \
+	echo "  Сгенерировано $$count файлов шрифтов в mupdf/generated/"
+
+lib_dir:
+	mkdir -p lib
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	find . -name "*.o" -delete
+	rm -f $(OUTPUT)
+
+.PHONY: all clean lib_dir generate-fonts

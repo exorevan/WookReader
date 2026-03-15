@@ -16,28 +16,8 @@ include $(DEVKITPRO)/libnx/switch_rules
 # DATA is a list of directories containing data files
 # INCLUDES is a list of directories containing header files
 # ROMFS is the directory containing data to be added to RomFS, relative to the Makefile (Optional)
-#
-# NO_ICON: if set to anything, do not use icon.
-# NO_NACP: if set to anything, no .nacp file is generated.
-# APP_TITLE is the name of the app stored in the .nacp file (Optional)
-# APP_AUTHOR is the author of the app stored in the .nacp file (Optional)
-# APP_VERSION is the version of the app stored in the .nacp file (Optional)
-# APP_TITLEID is the titleID of the app stored in the .nacp file (Optional)
-# ICON is the filename of the icon (.jpg), relative to the project folder.
-#   If not set, it attempts to use one of the following (in this order):
-#     - <Project name>.jpg
-#     - icon.jpg
-#     - <libnx folder>/default_icon.jpg
-#
-# CONFIG_JSON is the filename of the NPDM config file (.json), relative to the project folder.
-#   If not set, it attempts to use one of the following (in this order):
-#     - <Project name>.json
-#     - config.json
-#   If a JSON file is provided or autodetected, an ExeFS PFS0 (.nsp) is built instead
-#   of a homebrew executable (.nro). This is intended to be used for sysmodules.
-#   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
-TARGET		:=	$(notdir $(CURDIR))
+TARGET		:=	WookReader
 BUILD		:=	build
 SOURCES		:=	source source/menus/book source/menus/book-chooser source/helpers
 DATA		:=	data
@@ -45,12 +25,12 @@ INCLUDES    :=  include include/menus/book include/menus/book-chooser include/he
 ROMFS	    :=	romfs
 
 VERSION_MAJOR := 0
-VERSION_MINOR := 4
-VERSION_MICRO := 0
+VERSION_MINOR := 6
+VERSION_MICRO := 7
 
-APP_TITLE   := eBookReader
-APP_AUTHOR  := SeanOMik
-APP_VERSION := ${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_MICRO}-beta
+APP_TITLE   := WookReader
+APP_AUTHOR  := exorevan
+APP_VERSION := ${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_MICRO}-sigma
 ICON := icon.jpg
 
 #---------------------------------------------------------------------------------
@@ -58,29 +38,71 @@ ICON := icon.jpg
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS	:=	-g -std=c++17 -Wall -O2 -ffunction-sections \
+CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	-D__SWITCH__ $(INCLUDE) `sdl2-config --cflags`
 
-CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions #-DDEBUG=1 -DEXPERIMENTAL=1
+CXXFLAGS	:= $(CFLAGS) -std=c++17 -fno-rtti -fno-exceptions
 
 ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) -Wl,--allow-multiple-definition
 
-LIBS_REAL = stdc++fs SDL2_ttf SDL2_image png jpeg freetype webp z bz2 config nx mupdf mupdf-third
-## LIBS_REAL += mupdf_core mupdf_thirdparty
+# ── Список библиотек для линковки ────────────────────────────────────────────
+#
+# Порядок линковки: EXTRA_LIBS (наша libmupdf.a) идёт первой, затем LIBS_REAL.
+# Это гарантирует что MuPDF найдёт свои символы FreeType/libjpeg первыми,
+# а системные библиотеки заполняют только недостающее:
+#
+#  - freetype: НУЖЕН здесь. Системный harfbuzz (hb-ft.cc) требует функций
+#    из FreeType 2.11+ (FT_Get_Transform, FT_Get_MM_Var, FT_Get_Paint и др.),
+#    которых нет в урезанной FreeType внутри нашей libmupdf.a. Линкуется ПОСЛЕ
+#    libmupdf.a — MuPDF берёт свои символы из неё, harfbuzz добирает остальное
+#    из системной. Конфликтов нет, так как линкер уже "закрыл" символы MuPDF.
+#
+#  - jpeg: НУЖЕН здесь. SDL2_image (IMG_jpg.c) требует системный libjpeg
+#    (jpeg_CreateCompress и др.). Наша libmupdf.a содержит внутренний libjpeg,
+#    но его объектные файлы уже зафиксированы в архиве — повторной коллизии
+#    не будет, так как линкер берёт из libmupdf.a первым.
+#
+#  - mujs/one.c исключён из Makefile.mupdf (см. там) — это устраняет
+#    дублирование js* символов внутри самой libmupdf.a.
+LIBS_REAL = stdc++fs SDL2_ttf SDL2_image png harfbuzz freetype jpeg turbojpeg webp archive lzma lz4 zstd bz2 config nx m
 
 ifeq (,$(NODEBUG))
-LIBS_REAL += twili
+#LIBS_REAL += twili
 endif
-LIBS = $(addprefix -l,$(LIBS_REAL)) $(shell sdl2-config --libs)
+
+# Явная линковка нашей libmupdf.a первой, до системных библиотек.
+# Флаг -Wl,--whole-archive не нужен для статической библиотеки,
+# но порядок (-lmupdf перед -lfreetype и -ljpeg) критичен.
+#
+# ВАЖНО: используем $(TOPDIR), а не $(CURDIR).
+# При рекурсивном вызове make -C build/ значение $(CURDIR) меняется
+# на .../build/, и путь к libmupdf.a становится неверным.
+# $(TOPDIR) всегда указывает на корень проекта (задан выше как CURDIR).
+EXTRA_LIBS := $(TOPDIR)/lib/libmupdf.a
+
+export EXTRA_LIBS
+LIBS = $(EXTRA_LIBS) $(addprefix -l,$(LIBS_REAL)) $(shell sdl2-config --libs)
+
+# ВАЖНО: если линкер выдаёт "undefined reference to _binary_NimbusRoman_*_cff"
+# и подобные — директория mupdf/generated/ пуста. Сгенерируйте шрифты:
+#   cd mupdf && make generate
+# Это создаст .c файлы с встроенными шрифтами в mupdf/generated/
 
 #---------------------------------------------------------------------------------
-# list of directories containing libraries, this must be the top level containing
-# include and lib
+# Пути к библиотекам
+#
+# ВАЖНО: $(CURDIR)/mupdf убран из LIBDIRS, чтобы линкер не находил
+# автоматически portlibs-версию libmupdf.a, libfreetype.a или libjpeg.a
+# через стандартные пути поиска. Наша libmupdf.a подключается явно
+# через EXTRA_LIBS выше.
+#
+# Если другим библиотекам (SDL2_image, SDL2_ttf) нужны заголовки MuPDF,
+# они доступны через -I$(CURDIR)/mupdf/include в INCLUDE ниже.
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(PORTLIBS) $(LIBNX) $(CURDIR)/mupdf
+LIBDIRS	:= $(PORTLIBS) $(LIBNX) $(CURDIR)
 
 #---------------------------------------------------------------------------------
 # no real need to edit anything past this point unless you need to add additional
@@ -106,13 +128,9 @@ BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
 # use CXX for linking C++ projects, CC for standard C
 #---------------------------------------------------------------------------------
 ifeq ($(strip $(CPPFILES)),)
-#---------------------------------------------------------------------------------
 	export LD	:=	$(CC)
-#---------------------------------------------------------------------------------
 else
-#---------------------------------------------------------------------------------
 	export LD	:=	$(CXX)
-#---------------------------------------------------------------------------------
 endif
 #---------------------------------------------------------------------------------
 
@@ -123,6 +141,7 @@ export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
 
 export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+			-I$(CURDIR)/mupdf/include \
 			-I$(CURDIR)/$(BUILD)
 
 export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
@@ -169,14 +188,23 @@ ifneq ($(ROMFS),)
 	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: $(BUILD) clean all mupdf
+.PHONY: $(BUILD) clean all mupdf mupdf-clean
 
+#---------------------------------------------------------------------------------
+# Основная сборка зависит от libmupdf.a — собираем её первой если нужно
 #---------------------------------------------------------------------------------
 all: $(BUILD)
 
-$(BUILD):
+# Явная зависимость: перед сборкой приложения убедимся, что libmupdf.a есть.
+# Если она уже собрана, make не будет пересобирать её заново.
+$(BUILD): $(CURDIR)/lib/libmupdf.a
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+# Сборка libmupdf.a через Makefile.switch из корня проекта
+$(CURDIR)/lib/libmupdf.a:
+	@echo ">>> Сборка libmupdf.a ..."
+	@$(MAKE) -f $(CURDIR)/Makefile.switch
 
 #---------------------------------------------------------------------------------
 clean:
@@ -190,15 +218,16 @@ endif
 #---------------------------------------------------------------------------------
 mupdf-clean:
 	@echo cleaning mupdf ...
-	@$(MAKE) -C $(CURDIR)/mupdf clean
+	@$(MAKE) -f $(CURDIR)/Makefile.switch clean
 
 #---------------------------------------------------------------------------------
+# Ручная пересборка только libmupdf.a (без пересборки всего проекта)
 mupdf:
-	@$(MAKE) -f $(CURDIR)/Makefile.mupdf
+	@$(MAKE) -f $(CURDIR)/Makefile.switch
 
 #---------------------------------------------------------------------------------
 else
-.PHONY:	all
+.PHONY: all
 
 DEPENDS	:=	$(OFILES:.o=.d)
 
