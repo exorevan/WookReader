@@ -150,6 +150,22 @@ void SDL_DrawRotatedText(SDL_Renderer *renderer, TTF_Font *font, double rotation
 	SDL_RenderCopyEx(renderer, texture, NULL, &position, rotation, NULL, SDL_FLIP_NONE);
 }
 
+void SDL_DrawTextWrapped(SDL_Renderer *renderer, TTF_Font *font, int x, int y, int wrapWidth, int maxH, SDL_Color colour, const char *text)
+{
+	if (!text || !font) return;
+	SDL_Surface *surf = TTF_RenderUTF8_Blended_Wrapped(font, text, colour, (Uint32)wrapWidth);
+	if (!surf) return;
+	SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
+	int w = surf->w, h = surf->h;
+	SDL_FreeSurface(surf);
+	if (!tex) return;
+	int clip_h = (maxH > 0 && h > maxH) ? maxH : h;
+	SDL_Rect src = { 0, 0, w, clip_h };
+	SDL_Rect dst = { x, y, w, clip_h };
+	SDL_RenderCopy(renderer, tex, &src, &dst);
+	SDL_DestroyTexture(tex);
+}
+
 void SDL_DrawTextf(SDL_Renderer *renderer, TTF_Font *font, int x, int y, SDL_Color colour, const char *text, ...)
 {
 	char buffer[256];

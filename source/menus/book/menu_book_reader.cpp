@@ -18,8 +18,6 @@ extern void Log_Error(const std::string &msg);
 
 void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
 {
-    Log_Write(std::string("Menu_OpenBook: ") + path);
-
     BookReader *reader = NULL;
     int result = 0;
 
@@ -44,19 +42,20 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
     bool  touch_dragging   = false;
 
     bool helpMenu = false;
+    bool notesMenu = false;
 
     // Configure our supported input layout: a single player with standard controller syles
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     // Initialize the default gamepad (which reads handheld mode inputs as well as the first connected controller)
     PadState pad;
     padInitializeDefault(&pad);
-    // Touch_Process(&touchInfo);
+    padUpdate(&pad);  // consume stale A-press from MenuChooser
 
     while (result >= 0 && appletMainLoop())
     {
         SDL_TextCache_NextFrame();
         SDL_PumpEvents();  // drain SDL's internal event queue to prevent HID interference
-        reader->draw(helpMenu);
+        reader->draw(helpMenu, notesMenu);
 
         padUpdate(&pad);
 
@@ -67,7 +66,7 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
         HidTouchScreenState state = {0};
         hidGetTouchScreenStates(&state, 1);
 
-        if (!helpMenu)
+        if (!helpMenu && !notesMenu)
         {
             if (state.count == 1)
             {
@@ -154,7 +153,7 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
 
         touch_prev_count = state.count;
 
-        if (!helpMenu && kDown & HidNpadButton_ZL)
+        if (!helpMenu && !notesMenu && kDown & HidNpadButton_ZL)
         {
             if (reader->currentPageLayout() == BookPageLayoutPortrait)
             {
@@ -169,7 +168,7 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
                 reader->previous_page(1);
             }
         }
-        else if (!helpMenu && kDown & HidNpadButton_ZR)
+        else if (!helpMenu && !notesMenu && kDown & HidNpadButton_ZR)
         {
             if (reader->currentPageLayout() == BookPageLayoutPortrait)
             {
@@ -187,16 +186,16 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
 
         /*next page is set to 9 as hitting ZR or ZL will naturally turn a single page
          * 9 + 1 = 10*/
-        if (!helpMenu && kHeld & HidNpadButton_R && kDown & HidNpadButton_ZR)
+        if (!helpMenu && !notesMenu && kHeld & HidNpadButton_R && kDown & HidNpadButton_ZR)
         {
             reader->next_page(9);
         }
-        else if (!helpMenu && kHeld & HidNpadButton_L && kDown & HidNpadButton_ZL)
+        else if (!helpMenu && !notesMenu && kHeld & HidNpadButton_L && kDown & HidNpadButton_ZL)
         {
             reader->previous_page(9);
         }
 
-        if (!helpMenu && ((kDown & HidNpadButton_Up)))
+        if (!helpMenu && !notesMenu && ((kDown & HidNpadButton_Up)))
         {
             if (reader->currentPageLayout() == BookPageLayoutPortrait)
             {
@@ -211,7 +210,7 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
                 reader->previous_page(1);
             }
         }
-        if (!helpMenu && (kHeld & HidNpadButton_StickRUp))
+        if (!helpMenu && !notesMenu && (kHeld & HidNpadButton_StickRUp))
         {
             if (reader->currentPageLayout() == BookPageLayoutPortrait)
             {
@@ -226,7 +225,7 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
                 reader->previous_page(1);
             }
         }
-        else if (!helpMenu && (kHeld & HidNpadButton_StickRDown))
+        else if (!helpMenu && !notesMenu && (kHeld & HidNpadButton_StickRDown))
         {
             // Right stick down: reduced zoom sensitivity in Portrait, next page elsewhere.
             if (reader->currentPageLayout() == BookPageLayoutPortrait)
@@ -245,7 +244,7 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
 
         // DPad Down: full zoom-out in Portrait, next page in Landscape/Vertical.
         // Kept separate from StickR so it always fires at full sensitivity.
-        if (!helpMenu && (kDown & HidNpadButton_Down))
+        if (!helpMenu && !notesMenu && (kDown & HidNpadButton_Down))
         {
             if (reader->currentPageLayout() == BookPageLayoutPortrait)
             {
@@ -262,17 +261,17 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
         }
 
         // DPad Left/Right: previous/next page in all layout modes.
-        if (!helpMenu && (kDown & HidNpadButton_Left))
+        if (!helpMenu && !notesMenu && (kDown & HidNpadButton_Left))
         {
             reader->previous_page(1);
         }
-        if (!helpMenu && (kDown & HidNpadButton_Right))
+        if (!helpMenu && !notesMenu && (kDown & HidNpadButton_Right))
         {
             reader->next_page(1);
         }
 
         // Left analog stick: full 360° scrolling (analog, proportional speed)
-        if (!helpMenu)
+        if (!helpMenu && !notesMenu)
         {
             HidAnalogStickState stick_l = padGetStickPos(&pad, 0);
             const int deadzone = 4000;
@@ -318,16 +317,20 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
             }
         }
 
-        if (!helpMenu && kDown & HidNpadButton_LeftSR)
+        if (!helpMenu && !notesMenu && kDown & HidNpadButton_LeftSR)
             reader->next_page(10);
-        else if (!helpMenu && kDown & HidNpadButton_LeftSL)
+        else if (!helpMenu && !notesMenu && kDown & HidNpadButton_LeftSL)
             reader->previous_page(10);
 
         if (kUp & HidNpadButton_B)
         {
             if (helpMenu)
             {
-                helpMenu = !helpMenu;
+                helpMenu = false;
+            }
+            else if (notesMenu)
+            {
+                notesMenu = false;
             }
             else
             {
@@ -335,12 +338,36 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
             }
         }
 
-        if (!helpMenu && kDown & HidNpadButton_X)
+        if (!helpMenu && !notesMenu && kDown & HidNpadButton_X)
         {
             reader->permStatusBar = !reader->permStatusBar;
         }
 
-        if (!helpMenu && kDown & HidNpadButton_A)
+        // Y: open notes overlay
+        if (!helpMenu && !notesMenu && kDown & HidNpadButton_Y)
+        {
+            notesMenu = true;
+        }
+
+        if (notesMenu && kDown & HidNpadButton_A)
+        {
+            // Edit note via software keyboard
+            SwkbdConfig swkbd;
+            swkbdCreate(&swkbd, 0);
+            swkbdConfigSetType(&swkbd, SwkbdType_Normal);
+            swkbdConfigSetHeaderText(&swkbd, "Edit note");
+            swkbdConfigSetStringLenMax(&swkbd, 2000);
+            swkbdConfigSetStringLenMin(&swkbd, 0);
+            swkbdConfigSetBlurBackground(&swkbd, 1);
+            swkbdConfigSetInitialText(&swkbd, reader->notes().c_str());
+            swkbdConfigSetInitialCursorPos(&swkbd, 1);
+            char buf[2048] = {0};
+            Result rc = swkbdShow(&swkbd, buf, sizeof(buf));
+            swkbdClose(&swkbd);
+            if (R_SUCCEEDED(rc))
+                reader->set_notes(buf);
+        }
+        else if (!helpMenu && !notesMenu && kDown & HidNpadButton_A)
         {
             SwkbdConfig swkbd;
             swkbdCreate(&swkbd, 0);
@@ -356,23 +383,18 @@ void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount)
                 reader->goto_page(atoi(buf));
         }
 
-        if ((!helpMenu && kDown & HidNpadButton_StickL) || kDown & HidNpadButton_StickR)
+        if ((!helpMenu && !notesMenu && kDown & HidNpadButton_StickL) || kDown & HidNpadButton_StickR)
         {
             reader->reset_page();
         }
 
-        if (!helpMenu && kDown & HidNpadButton_Y)
-        {
-            reader->switch_page_layout();
-        }
-
-        if (!helpMenu && kUp & HidNpadButton_Minus)
+        if (!helpMenu && !notesMenu && kUp & HidNpadButton_Minus)
         {
             configDarkMode = !configDarkMode;
             reader->previous_page(0);
         }
 
-        if (kDown & HidNpadButton_Plus)
+        if (!notesMenu && kDown & HidNpadButton_Plus)
         {
             helpMenu = !helpMenu;
         }

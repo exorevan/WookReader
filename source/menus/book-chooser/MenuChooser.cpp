@@ -4,6 +4,7 @@ extern "C" {
 #include "SDL_helper.h"
 #include "common.h"
 #include "config.h"
+#include "fs.h"
 #include "menu_book_reader.h"
 #include "textures.h"
 }
@@ -27,6 +28,50 @@ namespace fs = filesystem;
 extern void Log_Write(const std::string& msg);
 extern void Log_Error(const std::string& msg);
 extern fz_context *ctx;
+
+// ── Per-comic notes helpers ───────────────────────────────────────────────────
+static const char* CHOOSER_NOTES_DIR = "/switch/WookReader/.notes";
+
+static string chooser_sanitize(const string& fpath) {
+  string name = fpath.substr(fpath.find_last_of("/\\") + 1);
+  const string bad = " :/?#[]@!$&'()*+,;=.";
+  for (char c : bad)
+    name.erase(remove(name.begin(), name.end(), c), name.end());
+  return name;
+}
+
+static string chooser_note_path(const string& fpath) {
+  return string(CHOOSER_NOTES_DIR) + "/" + chooser_sanitize(fpath) + ".txt";
+}
+
+static bool chooser_note_exists(const string& fpath) {
+  return FS_FileExists(chooser_note_path(fpath).c_str());
+}
+
+static string chooser_note_read(const string& fpath) {
+  string p = chooser_note_path(fpath);
+  FILE* f = fopen(p.c_str(), "r");
+  if (!f) return "";
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f); fseek(f, 0, SEEK_SET);
+  if (sz <= 0) { fclose(f); return ""; }
+  string text((size_t)sz, '\0');
+  size_t got = fread(&text[0], 1, (size_t)sz, f);
+  fclose(f);
+  text.resize(got);
+  text.erase(remove(text.begin(), text.end(), '\r'), text.end());
+  return text;
+}
+
+static void chooser_note_save(const string& fpath, const string& text) {
+  FS_RecursiveMakeDir(CHOOSER_NOTES_DIR);
+  string p = chooser_note_path(fpath);
+  if (text.empty()) { remove(p.c_str()); return; }
+  FILE* f = fopen(p.c_str(), "w");
+  if (!f) return;
+  fwrite(text.data(), 1, text.size(), f);
+  fclose(f);
+}
 
 /*This is for the colors array, don't have a great way of calculating it so i
  * use this definition*/
@@ -163,8 +208,40 @@ static void save_config(unsigned int chosenFolderColor,
   }
 }
 
+// Natural sort: compare strings so that embedded numbers sort numerically.
+// "file2" < "file11" < "file20", case-insensitive.
+static bool natural_less(const string& a, const string& b) {
+  size_t i = 0, j = 0;
+  while (i < a.size() && j < b.size()) {
+    bool a_dig = isdigit((unsigned char)a[i]);
+    bool b_dig = isdigit((unsigned char)b[j]);
+    if (a_dig && b_dig) {
+      // Skip leading zeros
+      size_t ai = i, bi = j;
+      while (ai < a.size() && a[ai] == '0') ai++;
+      while (bi < b.size() && b[bi] == '0') bi++;
+      // Find end of digit runs
+      size_t ae = ai, be = bi;
+      while (ae < a.size() && isdigit((unsigned char)a[ae])) ae++;
+      while (be < b.size() && isdigit((unsigned char)b[be])) be++;
+      size_t alen = ae - ai, blen = be - bi;
+      if (alen != blen) return alen < blen;  // more digits = bigger number
+      int cmp = a.compare(ai, alen, b, bi, blen);
+      if (cmp != 0) return cmp < 0;
+      i = ae; j = be;  // digit runs were equal — advance past them
+    } else {
+      char ca = tolower((unsigned char)a[i]);
+      char cb = tolower((unsigned char)b[j]);
+      if (ca != cb) return ca < cb;
+      i++; j++;
+    }
+  }
+  return a.size() < b.size();
+}
+
 static vector<fs::path> get_sorted_entries(const string& path,
-                                             list<string> allowedExtentions) {
+                                             list<string> allowedExtentions,
+                                             int *out_num_folders) {
   // Collect entries with is_directory and lowercase name cached during iteration
   // to avoid O(N log N) stat() calls in the sort comparator.
   struct EntryInfo { fs::path p; bool is_dir; string name_lower; };
@@ -192,11 +269,19 @@ static vector<fs::path> get_sorted_entries(const string& path,
     infos.push_back({entry.path(), is_dir, std::move(name_lower)});
   }
 
-  // Sort using cached values — zero stat() calls in comparator
+  // Sort using cached values — zero stat() calls in comparator; natural sort for numbers
   sort(infos.begin(), infos.end(), [](const EntryInfo& a, const EntryInfo& b) {
     if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
-    return a.name_lower < b.name_lower;
+    return natural_less(a.name_lower, b.name_lower);
   });
+
+  // Count folders from cached is_dir flags — no extra stat() calls
+  int nf = 0;
+  for (const auto& info : infos) {
+    if (!info.is_dir) break;
+    nf++;
+  }
+  *out_num_folders = nf;
 
   vector<fs::path> entries;
   entries.reserve(infos.size());
@@ -328,8 +413,13 @@ static string find_cover_in_rar3(const char* path) {
     fclose(f); return best;  // not RAR3 (RAR5 has 01 at byte 6 → fails here)
   }
 
+  // 3-second budget to prevent hangs on corrupt/huge archives
+  static const uint64_t BUDGET_TICKS = 57600000ULL;  // ~3s at 19.2 MHz
+  uint64_t t0 = armGetSystemTick();
+
   long pos = 7;  // byte offset of first real block (archive header)
   for (;;) {
+    if (armGetSystemTick() - t0 > BUDGET_TICKS) break;
     if (fseek(f, pos, SEEK_SET) != 0) break;
 
     // Base block header: HEAD_CRC(2) HEAD_TYPE(1) HEAD_FLAGS(2) HEAD_SIZE(2)
@@ -436,60 +526,71 @@ static unsigned char* extract_cbz_cover_pixels(const char* path, int tw, int th,
       // Fast path for RAR3 (CBR): scan file headers directly using PACK_SIZE fseeks.
       // Zero decompression — correct for both solid and non-solid, completes in ms.
       target_name = find_cover_in_rar3(path);
+    }
 
-      // Non-RAR3 formats (CBZ, CBT, CB7, RAR5): fall back to libarchive with a
-      // 3-second safety budget (these formats use fseek-based skips, so they're fast).
-      if (target_name.empty()) {
-        static const uint64_t BUDGET_TICKS = 57600000ULL; // ~3s at 19.2 MHz
-        struct archive* a1 = archive_read_new();
-        archive_read_support_format_all(a1);
-        archive_read_support_filter_all(a1);
-        if (archive_read_open_filename(a1, path, 1048576) == ARCHIVE_OK) {
-          struct archive_entry* e1;
-          uint64_t t0 = armGetSystemTick();
-          while (archive_read_next_header(a1, &e1) == ARCHIVE_OK) {
-            if (archive_entry_filetype(e1) == AE_IFDIR) { archive_read_data_skip(a1); continue; }
-            const char* n = archive_entry_pathname(e1);
-            if (!n || !is_image_file(n)) { archive_read_data_skip(a1); continue; }
-            string sn(n);
-            if (target_name.empty() || sn < target_name)
-              target_name = sn;
-            if (armGetSystemTick() - t0 > BUDGET_TICKS) break;
-          }
+    // Single-pass libarchive: find target (if not known) AND extract in one traversal.
+    {
+      struct archive* a = archive_read_new();
+      archive_read_support_format_all(a);
+      archive_read_support_filter_all(a);
+      if (archive_read_open_filename(a, path, 1048576) != ARCHIVE_OK) {
+        archive_read_free(a); return nullptr;
+      }
+
+      // Helper lambda: read entry data into cover_data
+      auto read_entry_data = [&](struct archive* ar, struct archive_entry* e) {
+        la_int64_t sz = archive_entry_size(e);
+        if (sz > 0) {
+          cover_data.resize((size_t)sz);
+          uint8_t* dst = cover_data.data(); size_t rem = (size_t)sz;
+          while (rem > 0) { la_ssize_t n = archive_read_data(ar, dst, rem); if (n <= 0) break; dst += n; rem -= (size_t)n; }
+          cover_data.resize((size_t)sz - rem);
+        } else {
+          cover_data.reserve(4 * 1024 * 1024);
+          uint8_t chunk[65536]; la_ssize_t n;
+          while ((n = archive_read_data(ar, chunk, sizeof(chunk))) > 0)
+            cover_data.insert(cover_data.end(), chunk, chunk + (size_t)n);
         }
-        archive_read_free(a1);
-      }
-      if (target_name.empty()) return nullptr;
-    }
+      };
 
-    // Read the target entry's raw bytes from the archive.
-    struct archive* a = archive_read_new();
-    archive_read_support_format_all(a);
-    archive_read_support_filter_all(a);
-    if (archive_read_open_filename(a, path, 1048576) != ARCHIVE_OK) {
-      archive_read_free(a); return nullptr;
-    }
-    struct archive_entry* entry;
-    while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
-      if (archive_entry_filetype(entry) == AE_IFDIR) continue;
-      const char* name = archive_entry_pathname(entry);
-      if (!name || string(name) != target_name) { archive_read_data_skip(a); continue; }
-      la_int64_t sz = archive_entry_size(entry);
-      if (sz > 0) {
-        cover_data.resize((size_t)sz);
-        uint8_t* dst = cover_data.data(); size_t rem = (size_t)sz;
-        while (rem > 0) { la_ssize_t n = archive_read_data(a, dst, rem); if (n <= 0) break; dst += n; rem -= (size_t)n; }
-        cover_data.resize((size_t)sz - rem);
+      struct archive_entry* entry;
+      if (!target_name.empty()) {
+        // Target known (from page-name cache or RAR3 scan): seek directly.
+        while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
+          if (archive_entry_filetype(entry) == AE_IFDIR) { archive_read_data_skip(a); continue; }
+          const char* name = archive_entry_pathname(entry);
+          if (!name || string(name) != target_name) { archive_read_data_skip(a); continue; }
+          read_entry_data(a, entry);
+          break;
+        }
       } else {
-        cover_data.reserve(4 * 1024 * 1024);
-        uint8_t chunk[65536]; la_ssize_t n;
-        while ((n = archive_read_data(a, chunk, sizeof(chunk))) > 0)
-          cover_data.insert(cover_data.end(), chunk, chunk + (size_t)n);
+        // Target unknown: scan for first image (sorted), extract on first encounter.
+        // For formats with sorted entries (most CBZ), the first image IS the cover.
+        // For unsorted archives, we take the first image found (3s budget).
+        static const uint64_t BUDGET_TICKS = 57600000ULL; // ~3s at 19.2 MHz
+        uint64_t t0 = armGetSystemTick();
+        string best_name;
+        while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
+          if (archive_entry_filetype(entry) == AE_IFDIR) { archive_read_data_skip(a); continue; }
+          const char* n = archive_entry_pathname(entry);
+          if (!n || !is_image_file(n)) { archive_read_data_skip(a); continue; }
+          string sn(n);
+          if (best_name.empty() || sn < best_name) {
+            best_name = sn;
+            // Extract this candidate (may be overwritten if a better name found,
+            // but most archives have sorted entries so this is usually final)
+            cover_data.clear();
+            read_entry_data(a, entry);
+          } else {
+            archive_read_data_skip(a);
+          }
+          if (armGetSystemTick() - t0 > BUDGET_TICKS) break;
+        }
+        target_name = best_name;
       }
-      break;
+      archive_read_free(a);
+      if (cover_data.empty()) return nullptr;
     }
-    archive_read_free(a);
-    if (cover_data.empty()) return nullptr;
 
     // Save to cover disk cache so future folder browses are instant.
     save_cover_cache(key, target_name, cover_data);
@@ -721,6 +822,11 @@ void Menu_StartChoosing() {
   int amountOfFiles = 0;
   bool isWarningOnScreen = false;
 
+  // Notes overlay state
+  bool drawNotesChooser = false;
+  string notesChooserPath;   // absolute path of the comic whose note is shown
+  string notesChooserText;   // cached note content
+
   // Cache for truncated display filenames: key = "fname|pixel_limit" → truncated string.
   unordered_map<string, string> trunc_cache;
 
@@ -781,16 +887,8 @@ void Menu_StartChoosing() {
     scroll_y     = 0;
     chosen_index = 0;
 
-    sorted_entries = get_sorted_entries(dir, allowedExtentions);
+    sorted_entries = get_sorted_entries(dir, allowedExtentions, &numFolders);
     amountOfFiles  = (int)sorted_entries.size();
-
-    // Count leading folder entries (sorted dirs-first).
-    numFolders = 0;
-    for (const auto& e : sorted_entries) {
-      std::error_code ec;
-      if (!fs::is_directory(e, ec)) break;
-      numFolders++;
-    }
 
     int numBooks = amountOfFiles - numFolders;
     cover_textures.resize(numBooks, nullptr);
@@ -836,22 +934,28 @@ void Menu_StartChoosing() {
     // ── Input ────────────────────────────────────────────────────────────────
 
     if (kUp & HidNpadButton_Plus) {
+      if (drawOption) {
+        // Closing options menu — save immediately
+        save_config(chosenFolderColor, chosenBookColor, scroll_option,
+                    zoom_option, configDarkMode);
+      }
       drawOption = !drawOption;
     }
 
     if (kDown & HidNpadButton_B) {
-      if (isWarningOnScreen) {
+      if (drawNotesChooser) {
+        drawNotesChooser = false;
+      } else if (isWarningOnScreen) {
         isWarningOnScreen = false;
+      } else if (drawOption) {
+        save_config(chosenFolderColor, chosenBookColor, scroll_option,
+                    zoom_option, configDarkMode);
+        drawOption = false;
       } else if (path == "/switch/WookReader") {
-        if (!isWarningOnScreen && !drawOption) {
-          save_config(chosenFolderColor, chosenBookColor, scroll_option,
-                      zoom_option, configDarkMode);
-          break;
-        } else {
-          isWarningOnScreen = false;
-          drawOption = false;
-        }
-      } else if (!drawOption) {
+        save_config(chosenFolderColor, chosenBookColor, scroll_option,
+                    zoom_option, configDarkMode);
+        break;
+      } else {
         // Navigate to parent directory
         string parent = path;
         while (!parent.empty() && parent.back() != '/') parent.pop_back();
@@ -859,12 +963,10 @@ void Menu_StartChoosing() {
         if (parent.empty()) parent = "/";
         path = parent;
         enter_directory(path);
-      } else {
-        drawOption = false;
       }
     }
 
-    if (kDown & HidNpadButton_A && !drawOption &&
+    if (kDown & HidNpadButton_A && !drawOption && !drawNotesChooser &&
         chosen_index < (int)sorted_entries.size()) {
       const fs::path& sel = sorted_entries[chosen_index];
       string filename = sel.filename().string();
@@ -1013,6 +1115,38 @@ void Menu_StartChoosing() {
       configDarkMode = !configDarkMode;
     }
 
+    // ── Y: notes for selected book ────────────────────────────────────────────
+    if (kDown & HidNpadButton_Y) {
+      if (drawNotesChooser) {
+        drawNotesChooser = false;
+      } else if (!drawOption && !isWarningOnScreen &&
+                 chosen_index >= numFolders &&
+                 chosen_index < amountOfFiles) {
+        notesChooserPath = sorted_entries[chosen_index].string();
+        notesChooserText = chooser_note_read(notesChooserPath);
+        drawNotesChooser = true;
+      }
+    }
+
+    // ── Notes overlay input ───────────────────────────────────────────────────
+    if (drawNotesChooser && kDown & HidNpadButton_A) {
+      SwkbdConfig swkbd;
+      swkbdCreate(&swkbd, 0);
+      swkbdConfigSetType(&swkbd, SwkbdType_Normal);
+      swkbdConfigSetHeaderText(&swkbd, "Edit note");
+      swkbdConfigSetStringLenMax(&swkbd, 2000);
+      swkbdConfigSetStringLenMin(&swkbd, 0);
+      swkbdConfigSetBlurBackground(&swkbd, 1);
+      swkbdConfigSetInitialText(&swkbd, notesChooserText.c_str());
+      swkbdConfigSetInitialCursorPos(&swkbd, 1);
+      char buf[2048] = {0};
+      Result rc = swkbdShow(&swkbd, buf, sizeof(buf));
+      swkbdClose(&swkbd);
+      if (R_SUCCEEDED(rc)) {
+        notesChooserText = buf;
+        chooser_note_save(notesChooserPath, notesChooserText);
+      }
+    }
     // ── Grid zoom (ZR = fewer cols / ZL = more cols) ──────────────────────────
     if (!drawOption && !isWarningOnScreen) {
       if ((kDown & HidNpadButton_ZR && cols > 2) ||
@@ -1206,7 +1340,7 @@ void Menu_StartChoosing() {
                            "Options Menu", windowX - themeWidth - 50,
                            windowY - 70, 35, 35, 5, 0);
 
-      string display_path = path.size() > 19 ? path.substr(19) : "";
+      string display_path = path.size() > 18 ? path.substr(18) : "";
       SDL_DrawText(RENDERER, ROBOTO_25, 10, windowY - 40, textColor,
                    display_path.c_str());
     }
@@ -1249,8 +1383,6 @@ void Menu_StartChoosing() {
           (bi < (int)cover_textures.size()) ? cover_textures[bi] : nullptr;
       int dx = cell_x, dy = cell_y, dw = cell_w, dh = cell_h;
       if (cover) {
-        int ctw, cth;
-        SDL_QueryTexture(cover, nullptr, nullptr, &ctw, &cth);
         // Texture decoded at exact thumb_w × thumb_h — blit 1:1 (or minor scale from cache hit)
         dw = thumb_w;
         dh = thumb_h;
@@ -1312,6 +1444,14 @@ void Menu_StartChoosing() {
       string entry_ext = sorted_entries[numFolders + bi].filename().extension().string();
       if (contains(warnedExtentions, entry_ext))
         SDL_DrawImageScale(RENDERER, warning, cell_x + cell_w - 28, cell_y + 4, 24, 24);
+
+      // Note badge (top-left corner) — teal dot when a note exists
+      if (chooser_note_exists(sorted_entries[numFolders + bi].string())) {
+        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(RENDERER, 0, 150, 136, 255);  // teal
+        SDL_Rect nb = { cell_x + 4, cell_y + 4, 12, 12 };
+        SDL_RenderFillRect(RENDERER, &nb);
+      }
     }
 
     // ── Empty folder label ────────────────────────────────────────────────────
@@ -1393,6 +1533,48 @@ void Menu_StartChoosing() {
                    textColor, "Zoom Amount: ");
       SDL_DrawTextf(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 3,
                     textColor, "%d", zoom_option);
+    }
+
+    // ── Notes overlay ─────────────────────────────────────────────────────────
+    if (drawNotesChooser) {
+      int noteWidth  = 800;
+      int noteHeight = 500;
+
+      if (!configDarkMode)
+        SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
+
+      SDL_DrawRect(RENDERER, (windowX - noteWidth) / 2,
+                   (windowY - noteHeight) / 2, noteWidth, noteHeight,
+                   configDarkMode ? HINT_COLOUR_DARK : HINT_COLOUR_LIGHT);
+
+      int nTextX = (windowX - noteWidth) / 2 + 20;
+      int nTextY = (windowY - noteHeight) / 2 + 10;
+
+      // Title: comic filename (no extension)
+      string noteFname = notesChooserPath.substr(notesChooserPath.find_last_of("/\\") + 1);
+      size_t dot = noteFname.find_last_of('.');
+      if (dot != string::npos) noteFname = noteFname.substr(0, dot);
+      SDL_DrawText(RENDERER, ROBOTO_25, nTextX, nTextY, textColor, noteFname.c_str());
+      SDL_DrawText(RENDERER, ROBOTO_20, nTextX, nTextY + 30, textColor, "Notes:");
+
+      // Hint at bottom
+      int hintY = (windowY + noteHeight) / 2 - 35;
+      if (ROBOTO_15)
+        SDL_DrawText(RENDERER, ROBOTO_15, nTextX, hintY, textColor,
+                     "A = Edit    B / Y = Close");
+
+      // Note body
+      int bodyY    = nTextY + 65;
+      int bodyMaxH = hintY - bodyY - 10;
+      if (notesChooserText.empty()) {
+        if (ROBOTO_25)
+          SDL_DrawText(RENDERER, ROBOTO_25, nTextX, bodyY,
+                       DARK_GRAY, "No notes yet. Press A to add one.");
+      } else if (ROBOTO_20) {
+        SDL_DrawTextWrapped(RENDERER, ROBOTO_20, nTextX, bodyY,
+                            noteWidth - 40, bodyMaxH, textColor,
+                            notesChooserText.c_str());
+      }
     }
 
     SDL_RenderPresent(RENDERER);

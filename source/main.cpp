@@ -200,19 +200,8 @@ bool Init_Services() {
   }
   Log_Write("Initialized Image");
 
-  // Initialize MuPDF context (store=0: no page cache, saves memory on Switch)
-  ctx = fz_new_context(NULL, NULL, 0);
-
-  if (!ctx) {
-    Log_Error("All fz_new_context attempts FAILED!");
-    Log_Error("MuPDF library is likely broken or incompatible.");
-    Term_Services();
-    return false;
-  }
-
-  fz_register_document_handlers(ctx);
-  Log_Write("Initialized MuPDF context and registered handlers");
-  // ===== КОНЕЦ ДИАГНОСТИКИ MuPDF =====
+  // MuPDF context deferred to first PDF/EPUB/XPS open (BookReader.cpp)
+  Log_Write("MuPDF init deferred to first use");
 
   if (TTF_Init() == -1) {
     Log_Error(std::string("TTF_Init failed: ") + TTF_GetError());

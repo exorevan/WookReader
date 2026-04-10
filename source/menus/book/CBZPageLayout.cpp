@@ -400,6 +400,12 @@ static bool extract_image(const char *path, const std::string &target_name,
                     size_t remaining = *out_size;
                     while (remaining > 0)
                     {
+                        if (cancel_flag && __atomic_load_n(cancel_flag, __ATOMIC_ACQUIRE))
+                        {
+                            SDL_free(*out_data); *out_data = nullptr; *out_size = 0;
+                            archive_read_free(a);
+                            return false;
+                        }
                         la_ssize_t n = archive_read_data(a, dst, remaining);
                         if (n <= 0) break;
                         dst += n;
@@ -416,7 +422,14 @@ static bool extract_image(const char *path, const std::string &target_name,
                 uint8_t chunk[65536];
                 la_ssize_t n;
                 while ((n = archive_read_data(a, chunk, sizeof(chunk))) > 0)
+                {
+                    if (cancel_flag && __atomic_load_n(cancel_flag, __ATOMIC_ACQUIRE))
+                    {
+                        archive_read_free(a);
+                        return false;
+                    }
                     buf.insert(buf.end(), chunk, chunk + n);
+                }
                 if (!buf.empty())
                 {
                     *out_size = buf.size();
@@ -762,6 +775,7 @@ CBZPageLayout::~CBZPageLayout()
     }
     if (_first_image_raw) { SDL_free(_first_image_raw); _first_image_raw = nullptr; }
     cancel_prefetch();
+    free_ready_textures();
     FreeTextureIfNeeded(&_tex);
     FreeTextureIfNeeded(&_tex_r);
 }
@@ -994,7 +1008,7 @@ void CBZPageLayout::do_prefetch(int slot)
         _pf_pixels[slot] = pixels;
         _pf_w[slot]      = w;
         _pf_h[slot]      = h;
-        _pf_ok[slot]     = true;
+        __atomic_store_n(&_pf_ok[slot], true, __ATOMIC_RELEASE);
     }
 }
 
@@ -1083,6 +1097,7 @@ void CBZPageLayout::cancel_prefetch()
             __atomic_store_n(&_pf_cancel[i], 1, __ATOMIC_RELEASE);
     for (int i = 0; i < N_PF; i++)
         cancel_one_slot(i);
+    free_ready_textures();
 }
 
 void CBZPageLayout::clamp_center()
@@ -1106,6 +1121,86 @@ void CBZPageLayout::apply_zoom(float v)
     clamp_center();
 }
 
+void CBZPageLayout::free_ready_textures()
+{
+    FreeTextureIfNeeded(&_ready_next);
+    FreeTextureIfNeeded(&_ready_prev);
+    _ready_next_pg = -1;
+    _ready_prev_pg = -1;
+    _ready_next_w  = 0;
+    _ready_next_h  = 0;
+    _ready_prev_w  = 0;
+    _ready_prev_h  = 0;
+}
+
+void CBZPageLayout::poll_prefetch()
+{
+    // Skip in spread mode — prefetch doesn't handle page pairs
+    if (_spread_mode) return;
+
+    for (int i = 0; i < N_PF; i++)
+    {
+        if (!_pf_active[i]) continue;
+        if (!__atomic_load_n(&_pf_ok[i], __ATOMIC_ACQUIRE)) continue;   // decode still running
+
+        // Decode finished — thread is about to exit or already exited.
+        threadWaitForExit(&_pf_thread[i]);   // instant (thread done)
+        threadClose(&_pf_thread[i]);
+        _pf_active[i] = false;
+
+        int pg = _pf_page[i];
+        unsigned char *pixels = _pf_pixels[i];
+        int pw = _pf_w[i];
+        int ph = _pf_h[i];
+        _pf_pixels[i] = nullptr;
+        _pf_page[i]   = -1;
+        _pf_ok[i]     = false;
+
+        if (!pixels) continue;
+
+        // Determine which ready slot this page belongs to
+        bool is_next = (pg == _current_page + 1);
+        bool is_prev = (pg == _current_page - 1);
+
+        // Skip if it doesn't match N+1 or N-1, or if we already have it
+        if (is_next && _ready_next_pg == pg) { free(pixels); continue; }
+        if (is_prev && _ready_prev_pg == pg) { free(pixels); continue; }
+        if (!is_next && !is_prev)            { free(pixels); continue; }
+
+        // Upload to GPU texture
+        SDL_Surface *s = SDL_CreateRGBSurfaceFrom(
+            pixels, pw, ph, 32, pw * 4,
+            0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
+
+        SDL_Texture *tex = nullptr;
+        if (s)
+        {
+            tex = SDL_CreateTextureFromSurface(RENDERER, s);
+            SDL_FreeSurface(s);
+        }
+        free(pixels);
+
+        if (!tex) continue;
+
+        if (is_next)
+        {
+            FreeTextureIfNeeded(&_ready_next);
+            _ready_next    = tex;
+            _ready_next_pg = pg;
+            _ready_next_w  = pw;
+            _ready_next_h  = ph;
+        }
+        else
+        {
+            FreeTextureIfNeeded(&_ready_prev);
+            _ready_prev    = tex;
+            _ready_prev_pg = pg;
+            _ready_prev_w  = pw;
+            _ready_prev_h  = ph;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
@@ -1119,7 +1214,57 @@ void CBZPageLayout::previous_page(int n)
         new_page = 0;
     if (new_page == _current_page)
         return;
-    load_page_texture(new_page, true);
+
+    // Try instant swap from ready texture (single-page, step==1 only)
+    if (!_spread_mode && step == 1 &&
+        _ready_prev && _ready_prev_pg == new_page)
+    {
+        // Recycle old current texture as the new _ready_next (instant forward-nav)
+        FreeTextureIfNeeded(&_ready_next);
+        FreeTextureIfNeeded(&_tex_r);
+        _ready_next    = _tex;
+        _ready_next_pg = _current_page;
+        _ready_next_w  = _tex_w;
+        _ready_next_h  = _tex_h;
+
+        _tex     = _ready_prev;
+        _tex_w   = _ready_prev_w;
+        _tex_h   = _ready_prev_h;
+        _tex_r_w = 0;
+
+        _ready_prev    = nullptr;
+        _ready_prev_pg = -1;
+        _ready_prev_w  = 0;
+        _ready_prev_h  = 0;
+
+        _current_page = new_page;
+
+        // Reset zoom for the new page dimensions
+        float eff_w = (_rotation == 90) ? (float)_tex_h : (float)_tex_w;
+        float eff_h = (_rotation == 90) ? (float)_tex_w : (float)_tex_h;
+        _min_zoom = std::min((float)_viewport.w / eff_w,
+                             (float)_viewport.h / eff_h);
+        _max_zoom = std::max((float)_viewport.w / eff_w,
+                             (float)_viewport.h / eff_h) * 2.0f;
+        _max_zoom = std::max(_max_zoom, _min_zoom * 4.0f);
+        _zoom = _min_zoom;
+        _cx   = _viewport.w / 2.0f;
+        _cy   = eff_h * _zoom / 2.0f;
+
+        // Launch new prefetch for N+1 and N-1
+        int pf_limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
+        int fwd  = (_current_page + 1 < pf_limit) ? _current_page + 1 : -1;
+        int bwd  = (_current_page - 1 >= 0)        ? _current_page - 1 : -1;
+        int fwd2 = (_current_page + 2 < pf_limit)  ? _current_page + 2 : -1;
+        start_prefetch(fwd, bwd, fwd2);
+    }
+    else
+    {
+        // Fallback: blocking load
+        free_ready_textures();
+        load_page_texture(new_page, true);
+    }
+
     if (_enumerating)
         _enum_current_name = _page_names[_current_page];
 }
@@ -1129,11 +1274,60 @@ void CBZPageLayout::next_page(int n)
     if (!_valid) return;
     int step = _spread_mode ? 2 * n : n;
     int new_page = _current_page + step;
-    // During enumeration, use discovered count instead of final page_count
     int limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
     if (new_page >= limit)
         return;
-    load_page_texture(new_page, true);
+
+    // Try instant swap from ready texture (single-page, step==1 only)
+    if (!_spread_mode && step == 1 &&
+        _ready_next && _ready_next_pg == new_page)
+    {
+        // Recycle old current texture as the new _ready_prev (instant back-nav)
+        FreeTextureIfNeeded(&_ready_prev);
+        FreeTextureIfNeeded(&_tex_r);
+        _ready_prev    = _tex;
+        _ready_prev_pg = _current_page;
+        _ready_prev_w  = _tex_w;
+        _ready_prev_h  = _tex_h;
+
+        _tex     = _ready_next;
+        _tex_w   = _ready_next_w;
+        _tex_h   = _ready_next_h;
+        _tex_r_w = 0;
+
+        _ready_next    = nullptr;
+        _ready_next_pg = -1;
+        _ready_next_w  = 0;
+        _ready_next_h  = 0;
+
+        _current_page = new_page;
+
+        // Reset zoom for the new page dimensions
+        float eff_w = (_rotation == 90) ? (float)_tex_h : (float)_tex_w;
+        float eff_h = (_rotation == 90) ? (float)_tex_w : (float)_tex_h;
+        _min_zoom = std::min((float)_viewport.w / eff_w,
+                             (float)_viewport.h / eff_h);
+        _max_zoom = std::max((float)_viewport.w / eff_w,
+                             (float)_viewport.h / eff_h) * 2.0f;
+        _max_zoom = std::max(_max_zoom, _min_zoom * 4.0f);
+        _zoom = _min_zoom;
+        _cx   = _viewport.w / 2.0f;
+        _cy   = eff_h * _zoom / 2.0f;
+
+        // Launch new prefetch for N+1 and N-1
+        int pf_limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
+        int fwd  = (_current_page + 1 < pf_limit) ? _current_page + 1 : -1;
+        int bwd  = (_current_page - 1 >= 0)        ? _current_page - 1 : -1;
+        int fwd2 = (_current_page + 2 < pf_limit)  ? _current_page + 2 : -1;
+        start_prefetch(fwd, bwd, fwd2);
+    }
+    else
+    {
+        // Fallback: blocking load (spread mode, multi-step skip, or no ready texture)
+        free_ready_textures();
+        load_page_texture(new_page, true);
+    }
+
     if (_enumerating)
         _enum_current_name = _page_names[_current_page];
 }
@@ -1146,6 +1340,7 @@ void CBZPageLayout::goto_page(int num)
     int target = std::min(std::max(0, num), limit - 1);
     if (target == _current_page)
         return;
+    free_ready_textures();
     load_page_texture(target, true);
     if (_enumerating)
         _enum_current_name = _page_names[_current_page];
@@ -1167,6 +1362,7 @@ void CBZPageLayout::toggle_spread()
     {
         _spread_mode = false;
     }
+    free_ready_textures();
     load_page_texture(_current_page, true);
 }
 

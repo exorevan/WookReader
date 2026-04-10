@@ -18,6 +18,7 @@ extern "C" {
 #include "SDL_helper.h"
 #include "common.h"
 #include "config.h"
+#include "fs.h"
 #include "status_bar.h"
 #include "textures.h"
 }
@@ -25,6 +26,41 @@ extern "C" {
 int windowX, windowY;
 config_t* config = NULL;
 const char* configFile = "/switch/WookReader/saved_pages.cfg";
+
+static const char* NOTES_DIR = "/switch/WookReader/.notes";
+
+static std::string notes_path(const char* book_name) {
+  return std::string(NOTES_DIR) + "/" + book_name + ".txt";
+}
+
+static std::string notes_load(const char* book_name) {
+  std::string path = notes_path(book_name);
+  FILE* f = fopen(path.c_str(), "r");
+  if (!f) return "";
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz <= 0) { fclose(f); return ""; }
+  std::string text((size_t)sz, '\0');
+  size_t got = fread(&text[0], 1, (size_t)sz, f);
+  fclose(f);
+  text.resize(got);
+  text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+  return text;
+}
+
+static void notes_save(const char* book_name, const std::string& text) {
+  FS_RecursiveMakeDir(NOTES_DIR);
+  std::string path = notes_path(book_name);
+  if (text.empty()) {
+    remove(path.c_str());
+    return;
+  }
+  FILE* f = fopen(path.c_str(), "w");
+  if (!f) return;
+  fwrite(text.data(), 1, text.size(), f);
+  fclose(f);
+}
 
 static int load_last_page(const char* book_name) {
   if (!config) {
@@ -82,6 +118,8 @@ BookReader::BookReader(const char* path, int* result) {
     book_name.erase(std::remove(book_name.begin(), book_name.end(), c),
                     book_name.end());
 
+  _notes = notes_load(book_name.c_str());
+
   _is_cbz = path_is_cbz(path);
 
   if (_is_cbz) {
@@ -101,8 +139,17 @@ BookReader::BookReader(const char* path, int* result) {
 
   // MuPDF path (PDF, EPUB, XPS, ...)
   Log_Write(std::string("BookReader: opening via MuPDF: ") + path);
+
+  // Lazy MuPDF init — deferred from startup to first PDF open
   if (ctx == NULL) {
-    Log_Error("BookReader: MuPDF context not initialized");
+    ctx = fz_new_context(NULL, NULL, 0);
+    if (ctx) {
+      fz_register_document_handlers(ctx);
+      Log_Write("BookReader: initialized MuPDF context on first use");
+    }
+  }
+  if (ctx == NULL) {
+    Log_Error("BookReader: MuPDF context initialization failed");
     *result = -4;
     return;
   }
@@ -178,6 +225,11 @@ void BookReader::goto_page(int page_1indexed) {
   save_last_page(book_name.c_str(), layout->current_page());
 }
 
+void BookReader::set_notes(const std::string &text) {
+  _notes = text;
+  notes_save(book_name.c_str(), _notes);
+}
+
 void BookReader::zoom_in(float zoom_amount) {
   if (!layout) return;
   layout->zoom_in(zoom_amount);
@@ -250,7 +302,7 @@ void BookReader::switch_page_layout() {
   }
 }
 
-void BookReader::draw(bool drawHelp) {
+void BookReader::draw(bool drawHelp, bool drawNotes) {
   if (configDarkMode == true) {
     SDL_ClearScreen(RENDERER, BLACK);
   } else {
@@ -296,8 +348,8 @@ void BookReader::draw(bool drawHelp) {
       SDL_RenderPresent(RENDERER);
       return;
     }
-    if (!cbz->is_valid()) {
-      // Enumeration just finished — finalize page count and prefetch.
+    if (cbz->is_enumerating_internal()) {
+      // Enum thread done but finish_enumeration() not yet called
       cbz->finish_enumeration();
       if (!cbz->is_valid()) {
         // Archive had no images or couldn't be opened
@@ -311,9 +363,10 @@ void BookReader::draw(bool drawHelp) {
     }
   }
 
-  // For MuPDF layouts, check if background rasterization has finished
-  // and swap in the newly rendered texture.
-  if (!_is_cbz)
+  // Poll background work: MuPDF rasterization or CBZ prefetch-to-texture upload
+  if (_is_cbz)
+    static_cast<CBZPageLayout*>(layout)->poll_prefetch();
+  else
     layout->poll_bg_render();
 
   layout->draw_page();
@@ -347,7 +400,7 @@ void BookReader::draw(bool drawHelp) {
     SDL_DrawButtonPrompt(RENDERER, left_stick_up_down, ROBOTO_25, textColor,
                          "Page up/down.", textX, textY + 38 * 3, 35, 35, 5, 0);
     SDL_DrawButtonPrompt(RENDERER, button_y, ROBOTO_25, textColor,
-                         "Rotate page.", textX, textY + 38 * 4, 35, 35, 5, 0);
+                         "Open notes.", textX, textY + 38 * 4, 35, 35, 5, 0);
     SDL_DrawButtonPrompt(RENDERER, button_x, ROBOTO_25, textColor,
                          "Keep status bar on.", textX, textY + 38 * 5, 35, 35,
                          5, 0);
@@ -357,9 +410,44 @@ void BookReader::draw(bool drawHelp) {
                          "Next page.", textX, textY + 38 * 7, 35, 35, 5, 0);
     SDL_DrawButtonPrompt(RENDERER, button_a, ROBOTO_25, textColor,
                          "Jump to page.", textX, textY + 38 * 8, 35, 35, 5, 0);
-    // SDL_DrawButtonPrompt(RENDERER, button_dpad_up_down,    ROBOTO_25,
-    // textColor, "Skip forward/backward 10 pages.", textX, textY + 38 * 7, 35,
-    // 35, 5, 0);
+  }
+
+  if (drawNotes) {
+    int noteWidth = 800;
+    int noteHeight = 500;
+
+    if (!configDarkMode) {
+      SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
+    }
+
+    SDL_DrawRect(RENDERER, (windowX - noteWidth) / 2,
+                 (windowY - noteHeight) / 2, noteWidth, noteHeight,
+                 configDarkMode ? HINT_COLOUR_DARK : HINT_COLOUR_LIGHT);
+
+    int nTextX = (windowX - noteWidth) / 2 + 20;
+    int nTextY = (windowY - noteHeight) / 2 + 10;
+    SDL_Color noteColor = configDarkMode ? WHITE : BLACK;
+
+    SDL_DrawText(RENDERER, ROBOTO_30, nTextX, nTextY, noteColor, "Notes:");
+
+    // Hint line at the bottom
+    int hintY = (windowY + noteHeight) / 2 - 35;
+    if (ROBOTO_15) {
+      SDL_DrawText(RENDERER, ROBOTO_15, nTextX, hintY, noteColor,
+                   "A = Edit    B = Close");
+    }
+
+    // Note body
+    int bodyY = nTextY + 45;
+    int bodyMaxH = hintY - bodyY - 10;
+    if (_notes.empty()) {
+      if (ROBOTO_25)
+        SDL_DrawText(RENDERER, ROBOTO_25, nTextX, bodyY,
+                     DARK_GRAY, "No notes yet. Press A to add one.");
+    } else if (ROBOTO_20) {
+      SDL_DrawTextWrapped(RENDERER, ROBOTO_20, nTextX, bodyY,
+                          noteWidth - 40, bodyMaxH, noteColor, _notes.c_str());
+    }
   }
 
   if (permStatusBar || --status_bar_visible_counter > 0) {

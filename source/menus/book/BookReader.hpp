@@ -36,7 +36,10 @@ public:
     void reset_page();
     void zoom_max();
     void switch_page_layout();
-    void draw(bool drawHelp);
+    void draw(bool drawHelp, bool drawNotes = false);
+
+    const std::string &notes() const { return _notes; }
+    void set_notes(const std::string &text);
 
     BookPageLayout currentPageLayout()
     {
@@ -56,6 +59,7 @@ private:
     std::string book_name;
     std::string book_path; // needed to reconstruct CBZPageLayout on layout switch
     bool _is_cbz = false;
+    std::string _notes;
 };
 
 #endif

@@ -34,6 +34,7 @@ public:
 
     bool is_valid()        const { return _valid; }
     bool is_enumerating()  const { return _enumerating && !__atomic_load_n(&_enum_done, __ATOMIC_ACQUIRE); }
+    bool is_enumerating_internal() const { return _enumerating; }  // true until finish_enumeration() called
     int  page_count()      const { return _page_count; }
 
     // Called once per frame from BookReader::draw() while is_enumerating().
@@ -45,12 +46,14 @@ public:
 
     void toggle_spread();
     void zoom_at_point(float delta, float px, float py);
+    void poll_prefetch();  // call once per frame to upload finished prefetch pixels to GPU
 
 private:
     // Load image at page index from the archive, build SDL_Texture, optionally reset zoom.
     void load_page_texture(int page_num, bool reset_zoom);
     void clamp_center();
     void apply_zoom(float new_zoom);
+    void free_ready_textures();
 
     std::string              _archive_path;          // path to the archive file
     std::vector<std::string> _page_names;            // sorted list of image filenames inside archive
@@ -90,6 +93,16 @@ private:
     float _cx       = 640.0f;
     float _cy       = 360.0f;
 
+    // Triple-buffer: pre-uploaded textures for instant page swap
+    SDL_Texture *_ready_next    = nullptr;
+    SDL_Texture *_ready_prev    = nullptr;
+    int          _ready_next_pg = -1;   // page index held by _ready_next, -1 = empty
+    int          _ready_prev_pg = -1;
+    int          _ready_next_w  = 0;
+    int          _ready_next_h  = 0;
+    int          _ready_prev_w  = 0;
+    int          _ready_prev_h  = 0;
+
     // Async prefetch: three parallel threads decode N+1, N-1, and N+2 on separate cores
     static constexpr int N_PF = 3;
     void start_prefetch(int fwd_page, int bwd_page, int fwd2_page);
@@ -109,7 +122,7 @@ private:
     int             _pf_w[N_PF]        = {};
     int             _pf_h[N_PF]        = {};
     volatile int    _pf_cancel[N_PF]   = {};
-    bool            _pf_ok[N_PF]       = {};
+    volatile int    _pf_ok[N_PF]       = {};
 
     char _info_buf[128];
 };
