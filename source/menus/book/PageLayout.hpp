@@ -44,6 +44,21 @@ public:
         return _current_page;
     }
 
+    virtual float get_zoom() const { return zoom; }
+    virtual void get_position(float &x, float &y) const {
+        x = page_center.x;
+        y = page_center.y;
+    }
+    virtual void set_zoom_and_position(float z, float x, float y) {
+        _has_saved_view = true;
+        _saved_zoom = z;
+        _saved_cx = x;
+        _saved_cy = y;
+    }
+    virtual int get_rotation() const { return 0; }
+    virtual bool get_spread_mode() const { return false; }
+    virtual void set_rotation_and_spread(int rot, bool spread) {}
+
     // Call from BookReader after constructing layout to enable background rasterization.
     void set_bg_path(const char *path);
 
@@ -67,12 +82,17 @@ public:
     virtual char *info();
     virtual bool pageFitsWidth() const  { return page_bounds.x1 * zoom <= viewport.w + 0.5f; }
     virtual bool pageFitsHeight() const { return page_bounds.y1 * zoom <= viewport.h + 0.5f; }
+    virtual float get_min_zoom_for_bounds(const fz_rect &bounds) const;
+    virtual float get_max_zoom_for_bounds(const fz_rect &bounds, float min_z) const;
+    virtual void update_min_max_zoom();
+    virtual void render_page_to_texture(int num, bool reset_zoom);
 
 protected:
-    virtual void render_page_to_texture(int num, bool reset_zoom);
     virtual void set_zoom(float value);
     virtual void move_page(float x, float y);
     virtual void top_of_page();
+    virtual void get_scroll_fractions(float &frac_x, float &frac_y) const;
+    virtual void apply_position(float old_zoom_factor, bool should_reset_zoom, bool keep_position, float frac_x, float frac_y);
 
     fz_document *doc = NULL;
     pdf_document *pdf = NULL;
@@ -85,6 +105,14 @@ protected:
 
     SDL_Rect viewport;
     SDL_Texture *page_texture = NULL;
+    float rendered_zoom = -1.0f;
+    uint32_t last_zoom_time = 0;
+    bool zoom_dirty = false;
+
+    bool _has_saved_view = false;
+    float _saved_zoom = 0.0f;
+    float _saved_cx = 0.0f;
+    float _saved_cy = 0.0f;
 
 private:
     std::string _bg_path;

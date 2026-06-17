@@ -137,17 +137,15 @@ void StatusBar_DisplayTime(bool portriat) {
   TTF_SizeText(ROBOTO_20, "\"+\" - Help", &helpWidth, &helpHeight);
 
   if (portriat) {
-    int timeX = (1280 - timeWidth) + timeHeight;
-    int timeY = (720 - timeWidth) + 15;
+    int timeX = 45 - (45 - timeHeight) / 2;
+    int timeY = 720 - timeWidth - 15;
     SDL_DrawRotatedText(RENDERER, ROBOTO_25, (double)90, timeX, timeY, WHITE,
                         Clock_GetCurrentTime());
 
-    int helpX = (1280 - helpWidth) + 21;
-    int helpY = (720 - helpHeight) - (720 - timeY) - 75;
+    int helpX = 45 - (45 - helpHeight) / 2;
+    int helpY = 15;
     SDL_DrawRotatedText(RENDERER, ROBOTO_20, (double)90, helpX, helpY, WHITE,
                         "\"+\" - Help");
-    // SDL_DrawRotatedText(RENDERER, ROBOTO_25, (double) 90, 1270 - width, (720
-    // - height), WHITE, Clock_GetCurrentTime());
   } else {
     SDL_DrawText(RENDERER, ROBOTO_25, 1260 - timeWidth, (40 - timeHeight) / 2,
                  WHITE, Clock_GetCurrentTime());
