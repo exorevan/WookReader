@@ -110,6 +110,9 @@ TTF_Font *ROBOTO_35, *ROBOTO_30, *ROBOTO_27, *ROBOTO_25, *ROBOTO_20, *ROBOTO_15;
 bool configDarkMode;
 bool configScreenButtons = false;
 bool configStatusBar = true;
+bool configKeepZoom = false;
+bool configKeepPosition = false;
+bool configStatusBarPageTurn = false;
 
 void Term_Services() {
   Log_Write("Terminate Services");
@@ -152,17 +155,22 @@ bool Init_Services() {
   twiliInitialize();
 #endif
 
-  // Однократная миграция: если /switch/eBookReader существует, а
-  // /switch/WookReader ещё нет — переименовываем папку целиком (books, configs,
-  // logs переезжают вместе).
+  // Однократная миграция: если /switch/eBookReader o /switch/WookReader existe, y
+  // /switch/WookReader no — reubicamos la carpeta para no perder la configuración/libros.
   {
-    struct stat st_old, st_new;
-    bool old_exists =
-        (stat("/switch/eBookReader", &st_old) == 0 && S_ISDIR(st_old.st_mode));
+    struct stat st_old_eb, st_old_wook, st_new;
+    bool eb_exists =
+        (stat("/switch/eBookReader", &st_old_eb) == 0 && S_ISDIR(st_old_eb.st_mode));
+    bool wook_exists =
+        (stat("/switch/WookReader", &st_old_wook) == 0 && S_ISDIR(st_old_wook.st_mode));
     bool new_exists =
         (stat("/switch/WookReader", &st_new) == 0 && S_ISDIR(st_new.st_mode));
-    if (old_exists && !new_exists)
-      rename("/switch/eBookReader", "/switch/WookReader");
+    if (!new_exists) {
+      if (wook_exists)
+        rename("/switch/WookReader", "/switch/WookReader");
+      else if (eb_exists)
+        rename("/switch/eBookReader", "/switch/WookReader");
+    }
   }
 
   // Сначала создаём папку и открываем лог
@@ -202,8 +210,14 @@ bool Init_Services() {
   }
   Log_Write("Initialized Image");
 
-  // MuPDF context deferred to first PDF/EPUB/XPS open (BookReader.cpp)
-  Log_Write("MuPDF init deferred to first use");
+  // Initialize MuPDF context on startup so covers are rendered immediately in chooser
+  ctx = fz_new_context(NULL, NULL, 0);
+  if (ctx) {
+    fz_register_document_handlers(ctx);
+    Log_Write("Initialized MuPDF context on startup");
+  } else {
+    Log_Error("Failed to initialize MuPDF context on startup");
+  }
 
   if (TTF_Init() == -1) {
     Log_Error(std::string("TTF_Init failed: ") + TTF_GetError());

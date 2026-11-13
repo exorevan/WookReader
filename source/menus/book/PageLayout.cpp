@@ -10,6 +10,8 @@ extern "C"
 #include "SDL_helper.h"
 }
 
+static bool get_page_bounds(fz_context *c, fz_document *d, int num, fz_rect *out_bounds);
+
 PageLayout::PageLayout(fz_document *doc, int current_page) : doc(doc), pdf(ctx ? pdf_specifics(ctx, doc) : nullptr), pages_count(ctx && doc ? fz_count_pages(ctx, doc) : 0)
 {
     if (!ctx || !doc)
@@ -93,13 +95,15 @@ void PageLayout::previous_page(int n)
 void PageLayout::next_page(int n)
 {
     render_page_to_texture(_current_page + n, false);
-    top_of_page();
+    if (!configKeepPosition)
+        top_of_page();
 }
 
 void PageLayout::goto_page(int num)
 {
     render_page_to_texture(num, false);  // clamps 0..pages_count-1 internally
-    top_of_page();
+    if (!configKeepPosition)
+        top_of_page();
 }
 
 void PageLayout::zoom_in(float zoom_amount)
@@ -256,6 +260,45 @@ void PageLayout::cancel_bg_render()
 
 void PageLayout::poll_bg_render()
 {
+    // Defer current page rasterization during zoom gesture
+    if (zoom_dirty && (SDL_GetTicks() - last_zoom_time > 250))
+    {
+        zoom_dirty = false;
+
+        // Invalidate prefetch cache since they are at the old zoom
+        cancel_pf_slot(_pf_fwd, &_pf_fwd_tex, &_pf_fwd_page, &_pf_fwd_zoom);
+        cancel_pf_slot(_pf_bwd, &_pf_bwd_tex, &_pf_bwd_page, &_pf_bwd_zoom);
+
+        if (_bg.bg_ctx && _bg.bg_doc)
+        {
+            start_bg_render(_current_page, zoom);
+        }
+        else
+        {
+            // Synchronous fallback
+            FreeTextureIfNeeded(&page_texture);
+            fz_page   *page = nullptr;
+            fz_pixmap *pix  = nullptr;
+            fz_try(ctx)
+            {
+                page = fz_load_page(ctx, doc, _current_page);
+                pix  = fz_new_pixmap_from_page_contents(ctx, page, fz_scale(zoom, zoom), fz_device_rgb(ctx), 0);
+                if (configDarkMode) fz_invert_pixmap(ctx, pix);
+                SDL_Surface *img = SDL_CreateRGBSurfaceFrom(pix->samples, pix->w, pix->h, pix->n * 8, pix->w * pix->n, 0x000000FF, 0x0000FF00, 0x00FF0000, 0);
+                page_texture = SDL_CreateTextureFromSurface(RENDERER, img);
+                SDL_FreeSurface(img);
+                fz_drop_pixmap(ctx, pix);
+                fz_drop_page(ctx, page);
+                rendered_zoom = zoom;
+            }
+            fz_catch(ctx)
+            {
+                fz_drop_pixmap(ctx, pix);
+                fz_drop_page(ctx, page);
+            }
+        }
+    }
+
     // Poll current-page render
     if (_bg.active && __atomic_load_n(&_bg.done, __ATOMIC_ACQUIRE))
     {
@@ -282,6 +325,7 @@ void PageLayout::poll_bg_render()
             {
                 FreeTextureIfNeeded(&page_texture);
                 page_texture = new_tex;
+                rendered_zoom = _bg.target_zoom;
             }
         }
 
@@ -361,6 +405,25 @@ void PageLayout::poll_pf_slot(BgRender& slot, SDL_Texture **tex, int *page_ref, 
     }
 }
 
+float PageLayout::get_min_zoom_for_bounds(const fz_rect &bounds) const
+{
+    if (bounds.x1 <= 0.0f || bounds.y1 <= 0.0f) return 1.0f;
+    return fmin(viewport.w / bounds.x1, viewport.h / bounds.y1);
+}
+
+float PageLayout::get_max_zoom_for_bounds(const fz_rect &bounds, float min_z) const
+{
+    if (bounds.x1 <= 0.0f || bounds.y1 <= 0.0f) return 4.0f;
+    float val = fmax(viewport.w / bounds.x1, viewport.h / bounds.y1);
+    return fmax(val, min_z * 4.0f);
+}
+
+void PageLayout::update_min_max_zoom()
+{
+    min_zoom = get_min_zoom_for_bounds(page_bounds);
+    max_zoom = get_max_zoom_for_bounds(page_bounds, min_zoom);
+}
+
 void PageLayout::start_prefetch()
 {
     if (!_pf_fwd.bg_ctx || !_pf_bwd.bg_ctx) return;
@@ -368,24 +431,48 @@ void PageLayout::start_prefetch()
     int target_fwd = _current_page + 1;
     int target_bwd = _current_page - 1;
 
+    float zoom_factor = 1.0f;
+    if (min_zoom > 0.0f)
+        zoom_factor = zoom / min_zoom;
+
     // Forward: skip if already ready or already rendering the right page at the right zoom
-    bool fwd_ready   = (_pf_fwd_tex && _pf_fwd_page == target_fwd && fabsf(_pf_fwd_zoom - zoom) < 0.001f);
-    bool fwd_running = (_pf_fwd.active && _pf_fwd.target_page == target_fwd && fabsf(_pf_fwd.target_zoom - zoom) < 0.001f);
+    float target_fwd_zoom = zoom;
+    if (target_fwd < pages_count) {
+        fz_rect bounds = fz_empty_rect;
+        if (get_page_bounds(ctx, doc, target_fwd, &bounds)) {
+            float t_min = get_min_zoom_for_bounds(bounds);
+            float t_max = get_max_zoom_for_bounds(bounds, t_min);
+            target_fwd_zoom = std::fmin(std::fmax(zoom_factor * t_min, t_min), t_max);
+        }
+    }
+
+    bool fwd_ready   = (_pf_fwd_tex && _pf_fwd_page == target_fwd && fabsf(_pf_fwd_zoom - target_fwd_zoom) < 0.001f);
+    bool fwd_running = (_pf_fwd.active && _pf_fwd.target_page == target_fwd && fabsf(_pf_fwd.target_zoom - target_fwd_zoom) < 0.001f);
     if (!fwd_ready && !fwd_running)
     {
         cancel_pf_slot(_pf_fwd, &_pf_fwd_tex, &_pf_fwd_page, &_pf_fwd_zoom);
         if (target_fwd < pages_count)
-            start_pf_slot(_pf_fwd, target_fwd, zoom, pf_fwd_thread_entry, 1);
+            start_pf_slot(_pf_fwd, target_fwd, target_fwd_zoom, pf_fwd_thread_entry, 1);
     }
 
     // Backward: same logic
-    bool bwd_ready   = (_pf_bwd_tex && _pf_bwd_page == target_bwd && fabsf(_pf_bwd_zoom - zoom) < 0.001f);
-    bool bwd_running = (_pf_bwd.active && _pf_bwd.target_page == target_bwd && fabsf(_pf_bwd.target_zoom - zoom) < 0.001f);
+    float target_bwd_zoom = zoom;
+    if (target_bwd >= 0) {
+        fz_rect bounds = fz_empty_rect;
+        if (get_page_bounds(ctx, doc, target_bwd, &bounds)) {
+            float t_min = get_min_zoom_for_bounds(bounds);
+            float t_max = get_max_zoom_for_bounds(bounds, t_min);
+            target_bwd_zoom = std::fmin(std::fmax(zoom_factor * t_min, t_min), t_max);
+        }
+    }
+
+    bool bwd_ready   = (_pf_bwd_tex && _pf_bwd_page == target_bwd && fabsf(_pf_bwd_zoom - target_bwd_zoom) < 0.001f);
+    bool bwd_running = (_pf_bwd.active && _pf_bwd.target_page == target_bwd && fabsf(_pf_bwd.target_zoom - target_bwd_zoom) < 0.001f);
     if (!bwd_ready && !bwd_running)
     {
         cancel_pf_slot(_pf_bwd, &_pf_bwd_tex, &_pf_bwd_page, &_pf_bwd_zoom);
         if (target_bwd >= 0)
-            start_pf_slot(_pf_bwd, target_bwd, zoom, pf_bwd_thread_entry, 2);
+            start_pf_slot(_pf_bwd, target_bwd, target_bwd_zoom, pf_bwd_thread_entry, 2);
     }
 }
 
@@ -408,6 +495,15 @@ static bool get_page_bounds(fz_context *c, fz_document *d, int num, fz_rect *out
 
 void PageLayout::render_page_to_texture(int num, bool reset_zoom)
 {
+    // 1. Calculate old scroll fractions before page bounds change
+    float frac_x = 0.5f;
+    float frac_y = 0.0f; // default to top of page
+    get_scroll_fractions(frac_x, frac_y);
+
+    float old_zoom_factor = 1.0f;
+    if (min_zoom > 0.0f)
+        old_zoom_factor = zoom / min_zoom;
+
     _current_page = std::min(std::max(0, num), pages_count - 1);
 
     // Fast sync path: load bounds only (no rasterization) to update zoom/center.
@@ -418,43 +514,46 @@ void PageLayout::render_page_to_texture(int num, bool reset_zoom)
         return;
     }
 
-    if (bounds.x1 != page_bounds.x1 || bounds.y1 != page_bounds.y1 || reset_zoom)
-    {
-        page_bounds = bounds;
-        page_center = fz_make_point(viewport.w / 2, viewport.h / 2);
-        min_zoom = fmin(viewport.w / bounds.x1, viewport.h / bounds.y1);
-        max_zoom = fmax(viewport.w / bounds.x1, viewport.h / bounds.y1);
-        zoom = min_zoom;
-    }
+    page_bounds = bounds;
+    update_min_max_zoom();
+
+    // Determine reset_zoom based on configKeepZoom
+    bool should_reset_zoom = reset_zoom || !configKeepZoom;
+
+    // Apply zoom and position settings using virtual method
+    apply_position(old_zoom_factor, should_reset_zoom, configKeepPosition, frac_x, frac_y);
 
     // Check prefetch cache — instant texture swap with no rendering
-    if (!reset_zoom)
+    if (_pf_fwd_tex && _pf_fwd_page == _current_page && fabsf(_pf_fwd_zoom - zoom) < 0.001f)
     {
-        if (_pf_fwd_tex && _pf_fwd_page == _current_page && fabsf(_pf_fwd_zoom - zoom) < 0.001f)
-        {
-            cancel_bg_render();
-            FreeTextureIfNeeded(&page_texture);
-            page_texture = _pf_fwd_tex;
-            _pf_fwd_tex  = nullptr;
-            _pf_fwd_page = -1;
-            start_prefetch();
-            return;
-        }
-        if (_pf_bwd_tex && _pf_bwd_page == _current_page && fabsf(_pf_bwd_zoom - zoom) < 0.001f)
-        {
-            cancel_bg_render();
-            FreeTextureIfNeeded(&page_texture);
-            page_texture = _pf_bwd_tex;
-            _pf_bwd_tex  = nullptr;
-            _pf_bwd_page = -1;
-            start_prefetch();
-            return;
-        }
+        cancel_bg_render();
+        FreeTextureIfNeeded(&page_texture);
+        page_texture = _pf_fwd_tex;
+        _pf_fwd_tex  = nullptr;
+        _pf_fwd_page = -1;
+        rendered_zoom = zoom;
+        zoom_dirty = false;
+        start_prefetch();
+        return;
+    }
+    if (_pf_bwd_tex && _pf_bwd_page == _current_page && fabsf(_pf_bwd_zoom - zoom) < 0.001f)
+    {
+        cancel_bg_render();
+        FreeTextureIfNeeded(&page_texture);
+        page_texture = _pf_bwd_tex;
+        _pf_bwd_tex  = nullptr;
+        _pf_bwd_page = -1;
+        rendered_zoom = zoom;
+        zoom_dirty = false;
+        start_prefetch();
+        return;
     }
 
     // No cache hit — use async background rasterization if available.
     if (_bg.bg_ctx && _bg.bg_doc)
     {
+        rendered_zoom = -1.0f; // texture not ready yet
+        zoom_dirty = false;
         start_bg_render(_current_page, zoom);
         return;
     }
@@ -476,6 +575,8 @@ void PageLayout::render_page_to_texture(int num, bool reset_zoom)
         SDL_FreeSurface(image);
         fz_drop_pixmap(ctx, pix);
         fz_drop_page(ctx, page);
+        rendered_zoom = zoom;
+        zoom_dirty = false;
     }
     fz_catch(ctx)
     {
@@ -493,38 +594,9 @@ void PageLayout::set_zoom(float value)
         return;
 
     zoom = value;
+    last_zoom_time = SDL_GetTicks();
+    zoom_dirty = true;
 
-    // Prefetch cache is at the old zoom — invalidate it
-    cancel_pf_slot(_pf_fwd, &_pf_fwd_tex, &_pf_fwd_page, &_pf_fwd_zoom);
-    cancel_pf_slot(_pf_bwd, &_pf_bwd_tex, &_pf_bwd_page, &_pf_bwd_zoom);
-
-    if (_bg.bg_ctx && _bg.bg_doc)
-    {
-        start_bg_render(_current_page, zoom);
-        // start_prefetch() will be called once the current-page render completes
-    }
-    else
-    {
-        FreeTextureIfNeeded(&page_texture);
-        fz_page   *page = nullptr;
-        fz_pixmap *pix  = nullptr;
-        fz_try(ctx)
-        {
-            page = fz_load_page(ctx, doc, _current_page);
-            pix  = fz_new_pixmap_from_page_contents(ctx, page, fz_scale(zoom, zoom), fz_device_rgb(ctx), 0);
-            if (configDarkMode) fz_invert_pixmap(ctx, pix);
-            SDL_Surface *img = SDL_CreateRGBSurfaceFrom(pix->samples, pix->w, pix->h, pix->n * 8, pix->w * pix->n, 0x000000FF, 0x0000FF00, 0x00FF0000, 0);
-            page_texture = SDL_CreateTextureFromSurface(RENDERER, img);
-            SDL_FreeSurface(img);
-            fz_drop_pixmap(ctx, pix);
-            fz_drop_page(ctx, page);
-        }
-        fz_catch(ctx)
-        {
-            fz_drop_pixmap(ctx, pix);
-            fz_drop_page(ctx, page);
-        }
-    }
     move_page(0, 0);
 }
 
@@ -532,8 +604,13 @@ void PageLayout::move_page(float x, float y)
 {
     float w = page_bounds.x1 * zoom, h = page_bounds.y1 * zoom;
 
-    page_center.x = fmin(fmax(page_center.x + x, w / 2), viewport.w - w / 2);
-    page_center.y = fmin(fmax(page_center.y + y, viewport.h - h / 2), h / 2);
+    float cx_lo = std::min(w / 2.0f, (float)viewport.w - w / 2.0f);
+    float cx_hi = std::max(w / 2.0f, (float)viewport.w - w / 2.0f);
+    page_center.x = std::fmin(std::fmax(page_center.x + x, cx_lo), cx_hi);
+
+    float cy_lo = std::min(h / 2.0f, (float)viewport.h - h / 2.0f);
+    float cy_hi = std::max(h / 2.0f, (float)viewport.h - h / 2.0f);
+    page_center.y = std::fmin(std::fmax(page_center.y + y, cy_lo), cy_hi);
 }
 
 void PageLayout::top_of_page()
@@ -549,4 +626,63 @@ void PageLayout::zoom_max()
     /*Although this should fix this for now figure out why this blurs the image*/
     zoom_out(0.6);
     zoom_in(0.6);
+}
+
+void PageLayout::get_scroll_fractions(float &frac_x, float &frac_y) const
+{
+    float w_old = page_bounds.x1 * zoom;
+    float h_old = page_bounds.y1 * zoom;
+
+    frac_x = 0.5f;
+    if (w_old > viewport.w) {
+        frac_x = (w_old / 2.0f - page_center.x) / (w_old - viewport.w);
+        frac_x = std::fmin(std::fmax(frac_x, 0.0f), 1.0f);
+    }
+    frac_y = 0.0f; // default to top of page
+    if (h_old > viewport.h) {
+        frac_y = (h_old / 2.0f - page_center.y) / (h_old - viewport.h);
+        frac_y = std::fmin(std::fmax(frac_y, 0.0f), 1.0f);
+    }
+}
+
+void PageLayout::apply_position(float old_zoom_factor, bool should_reset_zoom, bool keep_position, float frac_x, float frac_y)
+{
+    if (_has_saved_view)
+    {
+        zoom = std::fmin(std::fmax(_saved_zoom, min_zoom), max_zoom);
+        page_center.x = _saved_cx;
+        page_center.y = _saved_cy;
+        move_page(0, 0); // Clamp to viewport limits
+        _has_saved_view = false;
+    }
+    else if (should_reset_zoom)
+    {
+        zoom = min_zoom;
+        page_center = fz_make_point(viewport.w / 2.0f, viewport.h / 2.0f);
+    }
+    else
+    {
+        zoom = std::fmin(std::fmax(old_zoom_factor * min_zoom, min_zoom), max_zoom);
+
+        float w_new = page_bounds.x1 * zoom;
+        float h_new = page_bounds.y1 * zoom;
+
+        if (keep_position) {
+            // Keep relative scroll position
+            if (w_new > viewport.w) {
+                page_center.x = w_new / 2.0f - frac_x * (w_new - viewport.w);
+            } else {
+                page_center.x = viewport.w / 2.0f;
+            }
+            if (h_new > viewport.h) {
+                page_center.y = h_new / 2.0f - frac_y * (h_new - viewport.h);
+            } else {
+                page_center.y = viewport.h / 2.0f;
+            }
+        } else {
+            // Reset position to top of page (or center if fits)
+            page_center.x = viewport.w / 2.0f;
+            page_center.y = (h_new > viewport.h) ? (h_new / 2.0f) : (viewport.h / 2.0f);
+        }
+    }
 }

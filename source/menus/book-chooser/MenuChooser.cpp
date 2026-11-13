@@ -36,10 +36,16 @@ static const char* CHOOSER_NOTES_DIR = "/switch/WookReader/.notes";
 
 static string chooser_sanitize(const string& fpath) {
   string name = fpath.substr(fpath.find_last_of("/\\") + 1);
-  const string bad = " :/?#[]@!$&'()*+,;=.";
-  for (char c : bad)
-    name.erase(remove(name.begin(), name.end(), c), name.end());
-  return name;
+  string sanitized = "";
+  for (char c : name) {
+    if (isalnum((unsigned char)c) || c == '-' || c == '_') {
+      sanitized += c;
+    }
+  }
+  if (!sanitized.empty() && !isalpha((unsigned char)sanitized[0])) {
+    sanitized = "b" + sanitized;
+  }
+  return sanitized;
 }
 
 static string chooser_note_path(const string& fpath) {
@@ -68,16 +74,17 @@ static string chooser_note_read(const string& fpath) {
 static void chooser_note_save(const string& fpath, const string& text) {
   FS_RecursiveMakeDir(CHOOSER_NOTES_DIR);
   string p = chooser_note_path(fpath);
-  if (text.empty()) { remove(p.c_str()); return; }
+  if (text.empty()) { remove(p.c_str()); fsdevCommitDevice("sdmc"); return; }
   FILE* f = fopen(p.c_str(), "w");
   if (!f) return;
   fwrite(text.data(), 1, text.size(), f);
   fclose(f);
+  fsdevCommitDevice("sdmc");
 }
 
 // ── Reading history ───────────────────────────────────────────────────────────
 static const char RECENT_FILE[]     = "/switch/WookReader/.recent.lst";
-static const char RECENT_SENTINEL[] = "/WOOK_RECENT";
+static const char RECENT_SENTINEL[] = "/MEEP_RECENT";
 static vector<string> g_recent;
 
 static void load_recent() {
@@ -211,6 +218,18 @@ static int load_config(unsigned int* chosenFolderColor,
       config_setting_get_member(config_root_setting(optionConfig), "StatusBar");
   if (statbar) configStatusBar = config_setting_get_bool(statbar);
 
+  config_setting_t* kzoom =
+      config_setting_get_member(config_root_setting(optionConfig), "KeepZoom");
+  if (kzoom) configKeepZoom = config_setting_get_bool(kzoom);
+
+  config_setting_t* kpos =
+      config_setting_get_member(config_root_setting(optionConfig), "KeepPosition");
+  if (kpos) configKeepPosition = config_setting_get_bool(kpos);
+
+  config_setting_t* sbpt =
+      config_setting_get_member(config_root_setting(optionConfig), "StatusBarPageTurn");
+  if (sbpt) configStatusBarPageTurn = config_setting_get_bool(sbpt);
+
   return 0;
 }
 
@@ -264,7 +283,32 @@ static void save_config(unsigned int chosenFolderColor,
   if (statbar)
     config_setting_set_bool(statbar, configStatusBar);
 
+  config_setting_t* kzoom =
+      config_setting_get_member(config_root_setting(optionConfig), "KeepZoom");
+  if (!kzoom)
+    kzoom = config_setting_add(config_root_setting(optionConfig), "KeepZoom",
+                               CONFIG_TYPE_BOOL);
+  if (kzoom)
+    config_setting_set_bool(kzoom, configKeepZoom);
+
+  config_setting_t* kpos =
+      config_setting_get_member(config_root_setting(optionConfig), "KeepPosition");
+  if (!kpos)
+    kpos = config_setting_add(config_root_setting(optionConfig), "KeepPosition",
+                              CONFIG_TYPE_BOOL);
+  if (kpos)
+    config_setting_set_bool(kpos, configKeepPosition);
+
+  config_setting_t* sbpt =
+      config_setting_get_member(config_root_setting(optionConfig), "StatusBarPageTurn");
+  if (!sbpt)
+    sbpt = config_setting_add(config_root_setting(optionConfig), "StatusBarPageTurn",
+                               CONFIG_TYPE_BOOL);
+  if (sbpt)
+    config_setting_set_bool(sbpt, configStatusBarPageTurn);
+
   config_write_file(optionConfig, optionFile);
+  fsdevCommitDevice("sdmc");
 }
 
 // Natural sort: compare strings so that embedded numbers sort numerically.
@@ -729,13 +773,24 @@ static unsigned char* extract_pdf_cover_pixels(const char* path, int tw, int th,
       fz_throw(bg_ctx, FZ_ERROR_GENERIC, "no pages");
     page = fz_load_page(bg_ctx, doc, 0);
     fz_rect bounds = fz_bound_page(bg_ctx, page);
-    float scale = fminf((float)tw / bounds.x1, (float)th / bounds.y1);
+    float pw = bounds.x1 - bounds.x0;
+    float ph = bounds.y1 - bounds.y0;
+    if (pw <= 0.0f || ph <= 0.0f)
+      fz_throw(bg_ctx, FZ_ERROR_GENERIC, "invalid page bounds");
+    float scale = fminf((float)tw / pw, (float)th / ph);
     pix = fz_new_pixmap_from_page_contents(
         bg_ctx, page, fz_scale(scale, scale), fz_device_rgb(bg_ctx), 1);
-    size_t nbytes = (size_t)pix->h * pix->stride;
-    result = (unsigned char*)malloc(nbytes);
-    if (result) { memcpy(result, pix->samples, nbytes); }
-    *out_iw = pix->w; *out_ih = pix->h;
+    int stride = pix->stride;
+    int w = pix->w;
+    int h = pix->h;
+    int row_bytes = w * 4;
+    result = (unsigned char*)malloc((size_t)w * h * 4);
+    if (result) {
+      for (int y = 0; y < h; y++) {
+        memcpy(result + (size_t)y * row_bytes, pix->samples + (size_t)y * stride, row_bytes);
+      }
+    }
+    *out_iw = w; *out_ih = h;
   }
   fz_catch(bg_ctx) { result = nullptr; }
 
@@ -855,7 +910,7 @@ void Menu_StartChoosing() {
 
   bool drawOption  = false;
   int  option_index   = 0;
-  int  amountOfOptions = 6;
+  int  amountOfOptions = 9;
 
   string path = "/switch/WookReader";
 
@@ -925,11 +980,15 @@ void Menu_StartChoosing() {
 
   // Load saved progress (last page + total pages) for all book entries.
   auto load_entry_progress = [&]() {
-    if (!config) {
-      config = (config_t*)malloc(sizeof(config_t));
-      config_init(config);
-      config_read_file(config, configFile);
+    if (config) {
+      config_destroy(config);
+      free(config);
+      config = nullptr;
     }
+    config = (config_t*)malloc(sizeof(config_t));
+    config_init(config);
+    int read_rc = config_read_file(config, configFile);
+    Log_Write("load_entry_progress: read saved_pages.cfg, result=" + to_string(read_rc));
     int numBooks = (int)sorted_entries.size() - numFolders;
     entry_progress.assign(numBooks, {0, 0});
     for (int i = 0; i < numBooks; i++) {
@@ -937,7 +996,10 @@ void Menu_StartChoosing() {
       int last = 0, total = 0;
       config_setting_t* s =
           config_setting_get_member(config_root_setting(config), key.c_str());
-      if (s) last = config_setting_get_int(s);
+      if (s) {
+        last = config_setting_get_int(s);
+        Log_Write("load_entry_progress: key=" + key + " loaded last_page=" + to_string(last));
+      }
       string tkey = key + "_T";
       config_setting_t* st =
           config_setting_get_member(config_root_setting(config), tkey.c_str());
@@ -1110,6 +1172,15 @@ void Menu_StartChoosing() {
         case 5:
           configStatusBar = !configStatusBar;
           break;
+        case 6:
+          configKeepZoom = !configKeepZoom;
+          break;
+        case 7:
+          configKeepPosition = !configKeepPosition;
+          break;
+        case 8:
+          configStatusBarPageTurn = !configStatusBarPageTurn;
+          break;
         default: break;
       }
     }
@@ -1137,6 +1208,7 @@ void Menu_StartChoosing() {
             update_recent(book);
             Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
             if (inRecentFolder) enter_recent();
+            else load_entry_progress();
           } else {
             isWarningOnScreen = true;
           }
@@ -1148,6 +1220,7 @@ void Menu_StartChoosing() {
           update_recent(book);
           Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
           if (inRecentFolder) enter_recent();
+          else load_entry_progress();
         }
       }
     }
@@ -1227,6 +1300,15 @@ void Menu_StartChoosing() {
           case 5:
             configStatusBar = !configStatusBar;
             break;
+          case 6:
+            configKeepZoom = !configKeepZoom;
+            break;
+          case 7:
+            configKeepPosition = !configKeepPosition;
+            break;
+          case 8:
+            configStatusBarPageTurn = !configStatusBarPageTurn;
+            break;
           default: break;
         }
       } else if (!isWarningOnScreen && chosen_index >= numFolders) {
@@ -1266,6 +1348,15 @@ void Menu_StartChoosing() {
             break;
           case 5:
             configStatusBar = !configStatusBar;
+            break;
+          case 6:
+            configKeepZoom = !configKeepZoom;
+            break;
+          case 7:
+            configKeepPosition = !configKeepPosition;
+            break;
+          case 8:
+            configStatusBarPageTurn = !configStatusBarPageTurn;
             break;
           default: break;
         }
@@ -1428,6 +1519,7 @@ void Menu_StartChoosing() {
                 update_recent(book);
                 Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
                 if (inRecentFolder) enter_recent();
+                else load_entry_progress();
               }
             }
           }
@@ -1516,6 +1608,26 @@ void Menu_StartChoosing() {
       string display_path = path.size() > 18 ? path.substr(18) : "";
       SDL_DrawText(RENDERER, ROBOTO_25, 10, windowY - 40, textColor,
                    display_path.c_str());
+
+      if (chosen_index >= numFolders) {
+        int bi = chosen_index - numFolders;
+        if (bi >= 0 && bi < (int)entry_progress.size()) {
+          int last_pg = entry_progress[bi].first;
+          int total_pg = entry_progress[bi].second;
+          if (total_pg > 0) {
+            int percent = (total_pg > 1) ? (int)((float)last_pg / (total_pg - 1) * 100.0f) : 100;
+            if (percent > 100) percent = 100;
+            if (percent < 0) percent = 0;
+            int display_page = last_pg + 1;
+            if (display_page > total_pg) display_page = total_pg;
+            char prog_buf[128];
+            snprintf(prog_buf, sizeof(prog_buf), "Progress: %d%% (Page %d/%d)", percent, display_page, total_pg);
+            SDL_DrawText(RENDERER, ROBOTO_20, 10, windowY - 18, textColor, prog_buf);
+          } else {
+            SDL_DrawText(RENDERER, ROBOTO_20, 10, windowY - 18, textColor, "Progress: Not started");
+          }
+        }
+      }
     }
 
     // Clip content area to avoid overflowing into the bottom bar
@@ -1631,6 +1743,27 @@ void Menu_StartChoosing() {
         SDL_Rect nb = { cell_x + 4, cell_y + 4, 12, 12 };
         SDL_RenderFillRect(RENDERER, &nb);
       }
+
+      // Reading progress bar (drawn at the bottom of the thumbnail/cell)
+      if (bi >= 0 && bi < (int)entry_progress.size()) {
+        int last_pg = entry_progress[bi].first;
+        int total_pg = entry_progress[bi].second;
+        if (total_pg > 0) {
+          float pct = (float)last_pg / total_pg;
+          if (pct > 1.0f) pct = 1.0f;
+          if (pct < 0.0f) pct = 0.0f;
+          int pbar_h = 6;
+          int pbar_y = dy + dh - pbar_h;
+          SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_BLEND);
+          SDL_SetRenderDrawColor(RENDERER, 80, 80, 80, 200);
+          SDL_Rect pbar_bg = { dx, pbar_y, dw, pbar_h };
+          SDL_RenderFillRect(RENDERER, &pbar_bg);
+          SDL_SetRenderDrawColor(RENDERER, 0, 180, 160, 255); // Nice teal
+          SDL_Rect pbar_fill = { dx, pbar_y, (int)(dw * pct), pbar_h };
+          SDL_RenderFillRect(RENDERER, &pbar_fill);
+          SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_NONE);
+        }
+      }
     }
 
     // ── Empty folder label ────────────────────────────────────────────────────
@@ -1673,7 +1806,7 @@ void Menu_StartChoosing() {
 
     if (drawOption) {
       int helpWidth  = 680;
-      int helpHeight = 395;
+      int helpHeight = 515;
 
       if (!configDarkMode)
         SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
@@ -1722,6 +1855,21 @@ void Menu_StartChoosing() {
                    textColor, "Status Bar: ");
       SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 5,
                    textColor, configStatusBar ? "On" : "Off");
+
+      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38 * 6,
+                   textColor, "Keep Zoom: ");
+      SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 6,
+                   textColor, configKeepZoom ? "On" : "Off");
+
+      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38 * 7,
+                   textColor, "Keep Position: ");
+      SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 7,
+                   textColor, configKeepPosition ? "On" : "Off");
+
+      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38 * 8,
+                   textColor, "Page Turn Status: ");
+      SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 8,
+                   textColor, configStatusBarPageTurn ? "On" : "Off");
     }
 
     // ── Notes overlay ─────────────────────────────────────────────────────────
@@ -1788,5 +1936,11 @@ void Menu_StartChoosing() {
     config_destroy(optionConfig);
     free(optionConfig);
     optionConfig = nullptr;
+  }
+
+  if (config) {
+    config_destroy(config);
+    free(config);
+    config = nullptr;
   }
 }

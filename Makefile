@@ -139,9 +139,9 @@ export OFILES_SRC	:=	$(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
 export OFILES 	:=	$(OFILES_BIN) $(OFILES_SRC)
 export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
 
-export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
+export INCLUDE	:=	-I$(CURDIR)/mupdf/include \
+			$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
-			-I$(CURDIR)/mupdf/include \
 			-I$(CURDIR)/$(BUILD)
 
 export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
@@ -201,10 +201,10 @@ $(BUILD): $(CURDIR)/lib/libmupdf.a
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
-# Сборка libmupdf.a через Makefile.switch из корня проекта
+# Сборка libmupdf.a через Makefile.mupdf из корня проекта
 $(CURDIR)/lib/libmupdf.a:
 	@echo ">>> Сборка libmupdf.a ..."
-	@$(MAKE) -f $(CURDIR)/Makefile.switch
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf
 
 #---------------------------------------------------------------------------------
 clean:
@@ -218,12 +218,12 @@ endif
 #---------------------------------------------------------------------------------
 mupdf-clean:
 	@echo cleaning mupdf ...
-	@$(MAKE) -f $(CURDIR)/Makefile.switch clean
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf clean
 
 #---------------------------------------------------------------------------------
 # Ручная пересборка только libmupdf.a (без пересборки всего проекта)
 mupdf:
-	@$(MAKE) -f $(CURDIR)/Makefile.switch
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf
 
 #---------------------------------------------------------------------------------
 else
