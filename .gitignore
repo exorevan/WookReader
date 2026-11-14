@@ -16,3 +16,18 @@ build/
 # git has its own built in compression methods
 #*.7z
 #*.dmg
+
+# Local development environment imported from eBookReaderSwitch
+/.claude/
+/.project-memory/
+/AGENTS.md
+/MEMORY.md
+/tasks/
+/docs/
+/tests/
+/lib/
+/fonts/
+/build_cbz.sh
+/mupdf_gen_fonts.py
+/bin2coff.exe
+/bin2coff.obj

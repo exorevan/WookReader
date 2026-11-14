@@ -34,6 +34,7 @@ void SDL_ClearScreen(SDL_Renderer *renderer, SDL_Color colour);
 void SDL_DrawRect(SDL_Renderer *renderer, int x, int y, int w, int h, SDL_Color colour);
 void SDL_DrawCircle(SDL_Renderer *renderer, int x, int y, int r, SDL_Color colour);
 void SDL_DrawText(SDL_Renderer *renderer, TTF_Font *font, int x, int y, SDL_Color colour, const char *text);
+void SDL_DrawTextWrapped(SDL_Renderer *renderer, TTF_Font *font, int x, int y, int wrapWidth, int maxH, SDL_Color colour, const char *text);
 void SDL_DrawRotatedText(SDL_Renderer *renderer, TTF_Font *font, double rotation, int x, int y, SDL_Color colour, const char *text);
 void SDL_DrawTextf(SDL_Renderer *renderer, TTF_Font *font, int x, int y, SDL_Color colour, const char* text, ...);
 void SDL_LoadImage(SDL_Texture **texture, char *path);

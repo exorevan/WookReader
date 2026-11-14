@@ -10,6 +10,7 @@
 #include "LandscapePageLayout.hpp"
 #include "PageLayout.hpp"
 #include "VerticalPageLayout.hpp"
+#include "book_progress_key.hpp"
 
 extern void Log_Write(const std::string& msg);
 extern void Log_Error(const std::string& msg);
@@ -69,8 +70,9 @@ static int load_last_page(const char* book_name) {
     config_read_file(config, configFile);
   }
 
+  const std::string key = BookProgressKey(book_name);
   config_setting_t* setting =
-      config_setting_get_member(config_root_setting(config), book_name);
+      config_setting_get_member(config_root_setting(config), key.c_str());
 
   if (setting) {
     return config_setting_get_int(setting);
@@ -80,11 +82,12 @@ static int load_last_page(const char* book_name) {
 }
 
 static void save_last_page(const char* book_name, int current_page) {
+  const std::string key = BookProgressKey(book_name);
   config_setting_t* setting =
-      config_setting_get_member(config_root_setting(config), book_name);
+      config_setting_get_member(config_root_setting(config), key.c_str());
 
   if (!setting) {
-    setting = config_setting_add(config_root_setting(config), book_name,
+    setting = config_setting_add(config_root_setting(config), key.c_str(),
                                  CONFIG_TYPE_INT);
   }
 
@@ -96,7 +99,7 @@ static void save_last_page(const char* book_name, int current_page) {
 
 // Precondition: config is already initialized (always called after load_last_page).
 static void save_total_pages(const char* book_name, int total) {
-  std::string key = std::string(book_name) + "_T";
+  std::string key = BookProgressKey(book_name) + "_T";
   config_setting_t* setting =
       config_setting_get_member(config_root_setting(config), key.c_str());
   if (!setting)

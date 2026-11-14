@@ -201,10 +201,10 @@ $(BUILD): $(CURDIR)/lib/libmupdf.a
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
-# Сборка libmupdf.a через Makefile.switch из корня проекта
+# Сборка libmupdf.a через Makefile.mupdf из корня проекта
 $(CURDIR)/lib/libmupdf.a:
 	@echo ">>> Сборка libmupdf.a ..."
-	@$(MAKE) -f $(CURDIR)/Makefile.switch
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf
 
 #---------------------------------------------------------------------------------
 clean:
@@ -218,12 +218,12 @@ endif
 #---------------------------------------------------------------------------------
 mupdf-clean:
 	@echo cleaning mupdf ...
-	@$(MAKE) -f $(CURDIR)/Makefile.switch clean
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf clean
 
 #---------------------------------------------------------------------------------
 # Ручная пересборка только libmupdf.a (без пересборки всего проекта)
 mupdf:
-	@$(MAKE) -f $(CURDIR)/Makefile.switch
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf
 
 #---------------------------------------------------------------------------------
 else

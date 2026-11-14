@@ -22,6 +22,8 @@ extern "C" {
 #include <filesystem>
 #include <iostream>
 
+#include "book_progress_key.hpp"
+
 using namespace std;
 namespace fs = filesystem;
 
@@ -933,7 +935,8 @@ void Menu_StartChoosing() {
     int numBooks = (int)sorted_entries.size() - numFolders;
     entry_progress.assign(numBooks, {0, 0});
     for (int i = 0; i < numBooks; i++) {
-      string key = chooser_sanitize(sorted_entries[numFolders + i].string());
+      string key = BookProgressKey(
+          chooser_sanitize(sorted_entries[numFolders + i].string()));
       int last = 0, total = 0;
       config_setting_t* s =
           config_setting_get_member(config_root_setting(config), key.c_str());
@@ -1137,6 +1140,7 @@ void Menu_StartChoosing() {
             update_recent(book);
             Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
             if (inRecentFolder) enter_recent();
+            else load_entry_progress();
           } else {
             isWarningOnScreen = true;
           }
@@ -1148,6 +1152,7 @@ void Menu_StartChoosing() {
           update_recent(book);
           Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
           if (inRecentFolder) enter_recent();
+          else load_entry_progress();
         }
       }
     }
@@ -1428,6 +1433,7 @@ void Menu_StartChoosing() {
                 update_recent(book);
                 Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
                 if (inRecentFolder) enter_recent();
+                else load_entry_progress();
               }
             }
           }
