@@ -10,11 +10,9 @@ public:
     VerticalPageLayout(fz_document *doc, int current_page);
 
     void reset();
-    void next_page(int n);
 
-private:
-    // Override min/max/zoom so the page always fills the viewport width.
-    void apply_fit_to_width();
+    float get_min_zoom_for_bounds(const fz_rect &bounds) const override;
+    float get_max_zoom_for_bounds(const fz_rect &bounds, float min_z) const override;
 };
 
 #endif

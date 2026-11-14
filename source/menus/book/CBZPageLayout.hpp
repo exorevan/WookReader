@@ -32,6 +32,18 @@ public:
     void draw_page() override;
     char *info() override;
 
+    float get_zoom() const override { return _zoom; }
+    void get_position(float &x, float &y) const override {
+        x = _cx;
+        y = _cy;
+    }
+    int get_rotation() const override { return _rotation; }
+    bool get_spread_mode() const override { return _spread_mode; }
+    void set_rotation_and_spread(int rot, bool spread) override {
+        _rotation = rot;
+        _spread_mode = spread;
+    }
+
     bool is_valid()        const { return _valid; }
     bool is_enumerating()  const { return _enumerating && !__atomic_load_n(&_enum_done, __ATOMIC_ACQUIRE); }
     bool is_enumerating_internal() const { return _enumerating; }  // true until finish_enumeration() called
@@ -57,9 +69,9 @@ public:
         return vh <= _viewport.h + 0.5f;
     }
 
+    void render_page_to_texture(int num, bool reset_zoom) override;
+
 private:
-    // Load image at page index from the archive, build SDL_Texture, optionally reset zoom.
-    void load_page_texture(int page_num, bool reset_zoom);
     void clamp_center();
     void apply_zoom(float new_zoom);
     void free_ready_textures();
